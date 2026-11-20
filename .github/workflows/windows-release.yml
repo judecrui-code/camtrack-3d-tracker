@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish as a GitHub release (e.g. 1.0.0). Leave empty to only build."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -78,7 +83,7 @@ jobs:
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
-          $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "0.0.0-dev" }
+          $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } elseif ("${{ inputs.version }}") { "${{ inputs.version }}" } else { "0.0.0-dev" }
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
             if (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") { $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6" }
             else { choco install innosetup -y --no-progress; $env:PATH += ";${env:ProgramFiles(x86)}\Inno Setup 6" }
@@ -94,9 +99,12 @@ jobs:
           retention-days: 30
 
       - name: Publish GitHub release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.version != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', inputs.version) }}
+          target_commitish: ${{ github.sha }}
+          name: CamTrack ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', inputs.version) }}
           files: release/*
           generate_release_notes: true
           body: |
