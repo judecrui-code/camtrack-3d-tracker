@@ -88,7 +88,7 @@ def test_rotation_ransac():
     b = a @ R.T
     b[:20] = bearings(rng.uniform(-0.5, 0.5, (20, 2)))  # outliers
     Re, inl = ransac_rotation(a, b, 1e-3, 200, rng)
-    assert np.degrees(np.arccos((np.trace(Re @ R.T) - 1) / 2)) < 1e-3
+    assert np.degrees(np.arccos(np.clip((np.trace(Re @ R.T) - 1) / 2, -1, 1))) < 1e-3
     assert inl[20:].all()
 
 
