@@ -1,0 +1,8 @@
+# Tested with Python 3.13 (3.10+ supported)
+numpy>=2.0
+scipy>=1.13
+opencv-python-headless>=4.10
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pycolmap>=3.11   # COLMAP engine (optional at runtime; native engine does not need it)

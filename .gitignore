@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+test_footage/*.mp4
+*.blend
+*.blend1
+build/
+dist/
+release/
+packaging/bin/
+packaging/camtrack.ico
+smoke/
+smoke_data/
