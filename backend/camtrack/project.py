@@ -55,6 +55,12 @@ class Project:
     def load(self):
         with open(os.path.join(self.dir, "project.json"), encoding="utf-8") as fh:
             self.meta = json.load(fh)
+        # v1.0.1 briefly defaulted to Auto frame sampling (frame_step 0); every frame is the default again.
+        if self.meta.get("settings_version", 1) < 2:
+            if (self.meta.get("settings") or {}).get("frame_step") == 0:
+                self.meta["settings"]["frame_step"] = 1
+            self.meta["settings_version"] = 2
+            self.save()
         return self
 
     @property
@@ -118,6 +124,7 @@ class ProjectStore:
         info.path = dst
         p.meta = dict(id=pid, name=os.path.splitext(filename)[0], video_file="source" + ext, info=info.to_dict(),
                       settings=AnalysisSettings(frame_start=0, frame_end=info.frame_count - 1).to_dict(),
+                      settings_version=2,
                       state="imported", created=time.time(), scene=default_scene(), deleted_points=[],
                       frames_cached=False)
         p.save()

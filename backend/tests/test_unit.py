@@ -136,13 +136,15 @@ def test_robust_estimators_still_find_correct_models():
 
 
 def test_auto_frame_step():
-    s = AnalysisSettings.from_dict({})
-    assert s.frame_step == 0
-    assert effective_frame_step(s, 30, 120) == 1           # 30 fps short clip: every frame
-    assert effective_frame_step(s, 60, 600) == 2           # 60 fps: ~30 fps
-    assert effective_frame_step(s, 59.94, 1101) == 3       # long 60 fps clip stays under 400 tracked frames
+    d = AnalysisSettings.from_dict({})
+    assert d.frame_step == 1                                # default: every frame, never skipped
+    assert effective_frame_step(d, 60, 1101) == 1
+    s = AnalysisSettings.from_dict({"frame_step": 0})       # Auto is opt-in
+    assert effective_frame_step(s, 30, 120) == 1
+    assert effective_frame_step(s, 60, 600) == 2
+    assert effective_frame_step(s, 59.94, 1101) == 3
     assert 1101 / effective_frame_step(s, 59.94, 1101) <= 400
-    assert effective_frame_step(AnalysisSettings.from_dict({"frame_step": 4}), 60, 1101) == 4  # explicit wins
+    assert effective_frame_step(AnalysisSettings.from_dict({"frame_step": 4}), 60, 1101) == 4
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ class AnalysisSettings:
     frame_start: Optional[int] = None   # inclusive, original frame numbers
     frame_end: Optional[int] = None     # inclusive
     processing_width: int = 0           # 0 = auto (long edge 1280, never upscaled)
-    frame_step: int = 0                 # track every Nth frame; 0 = auto (about 30 fps, at most 400 frames)
+    frame_step: int = 1                 # track every Nth frame (1 = every frame, the default); 0 = auto (opt-in: ~30 fps, <=400 frames)
     # --- feature tracking ---
     detection_quality: str = "standard"  # draft / standard / high
     max_points: int = 3000              # max simultaneous tracked features
