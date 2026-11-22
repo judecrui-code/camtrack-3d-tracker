@@ -32,7 +32,7 @@ from ..config import AnalysisSettings
 from ..tracking.tracker import TrackSet
 from .bundle import BAProblem, bundle_adjust, reprojection_errors, refine_points
 from .geometry import (K_matrix, bearings, pose_center, ransac_rotation, ray_angle_deg, rot_to_quat,
-                       quat_to_rot, slerp, triangulate_multiview, undistort_normalized, project)
+                       quat_to_rot, slerp, triangulate_multiview, undistort_normalized, project, robust_essential, robust_homography)
 
 
 class SolveFailed(Exception):
@@ -196,21 +196,27 @@ class SequentialSfM:
         th = self.thresh / self.f
         hyps = []
         info = {"common": len(tr)}
-        E, mask = cv2.findEssentialMat(xa, xb, np.eye(3), cv2.USAC_MAGSAC, 0.9999, th)
-        if E is not None and E.shape[0] >= 3:
-            E = E[:3]
-            n, R, t, mpose = cv2.recoverPose(E, xa, xb, np.eye(3), mask=mask.copy())
-            t = t.ravel()
-            X, good, ang = self._triangulate_pair(xa, xb, R, t)
-            good &= (mask.ravel() > 0)
-            info["e_inliers"] = int(mask.sum())
-            if good.sum() >= 15:
-                hyps.append(dict(kind="E", R=R, t=t, tracks=tr[good], X=X[good], ang=float(np.median(ang[good])),
-                                 n=int(good.sum())))
-        H, hmask = cv2.findHomography(xa, xb, cv2.USAC_MAGSAC, th, maxIters=2000, confidence=0.999)
+        E, mask = robust_essential(xa, xb, th, 0.9999)
+        if E is not None:
+            try:
+                n, R, t, mpose = cv2.recoverPose(E, xa, xb, np.eye(3), mask=mask.copy())
+            except cv2.error:
+                R = None
+            if R is not None:
+                t = t.ravel()
+                X, good, ang = self._triangulate_pair(xa, xb, R, t)
+                good &= (mask.ravel() > 0)
+                info["e_inliers"] = int(mask.sum())
+                if good.sum() >= 15:
+                    hyps.append(dict(kind="E", R=R, t=t, tracks=tr[good], X=X[good], ang=float(np.median(ang[good])),
+                                     n=int(good.sum())))
+        H, hmask = robust_homography(xa, xb, th)
         info["h_inliers"] = int(hmask.sum()) if hmask is not None else 0
         if use_h and H is not None:
-            nsol, Rs, ts_, ns = cv2.decomposeHomographyMat(H, np.eye(3))
+            try:
+                nsol, Rs, ts_, ns = cv2.decomposeHomographyMat(H, np.eye(3))
+            except cv2.error:
+                nsol, Rs, ts_, ns = 0, [], [], []
             for R, t in zip(Rs, ts_):
                 t = t.ravel()
                 if np.linalg.norm(t) < 1e-9:
@@ -257,7 +263,7 @@ class SequentialSfM:
             f = fcands[len(fcands) // 2]
             xa = undistort_normalized(self.obs_xy[ia], f, self.cx, self.cy, self.k1, self.k2)
             xb = undistort_normalized(self.obs_xy[ib], f, self.cx, self.cy, self.k1, self.k2)
-            E, mask = cv2.findEssentialMat(xa, xb, np.eye(3), cv2.USAC_MAGSAC, 0.999, 1.5 * self.thresh / f)
+            E, mask = robust_essential(xa, xb, 1.5 * self.thresh / f)
             ef = float(mask.mean()) if mask is not None else 0.0
             rot_fracs.append(best)
             e_fracs.append(ef)

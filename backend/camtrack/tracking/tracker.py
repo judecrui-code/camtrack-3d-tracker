@@ -28,6 +28,7 @@ import numpy as np
 
 from ..config import AnalysisSettings, QUALITY_PARAMS
 from ..footage import iter_frames, processing_size
+from ..solver.geometry import robust_fundamental
 
 
 @dataclass
@@ -202,7 +203,7 @@ class FeatureTracker:
                         b = np.array([active[i].xy[-1] for i in idx], np.float64)
                         disp = np.median(np.linalg.norm(a - b, axis=1))
                         if disp > 0.5:  # need some motion for F to mean anything
-                            F, mask = cv2.findFundamentalMat(a, b, cv2.USAC_MAGSAC, self.f_thresh, 0.999, 2000)
+                            F, mask = robust_fundamental(a, b, self.f_thresh)
                             if F is not None and F.shape == (3, 3):
                                 # Sampson distance for every correspondence
                                 ah = np.c_[a, np.ones(len(a))]
@@ -400,5 +401,12 @@ def run_tracking(video_path: str, info, settings: AnalysisSettings, report) -> T
     end = settings.frame_end if settings.frame_end is not None else info.frame_count - 1
     start = max(0, min(start, info.frame_count - 1))
     end = max(start, min(end, info.frame_count - 1))
+    from ..config import effective_frame_step
+    step = effective_frame_step(settings, info.fps, end - start + 1)
+    if step != settings.frame_step and hasattr(report, "log"):
+        report.log(f"Auto frame sampling: tracking every {step} frame(s) "
+                   f"({(end - start) // step + 1} of {end - start + 1} frames; {info.fps / step:.1f} fps effective)")
     tr = FeatureTracker(settings, pw, ph)
-    return tr.run(video_path, start, end, settings.frame_step, scale, report)
+    ts = tr.run(video_path, start, end, step, scale, report)
+    ts.stats["frame_step"] = step
+    return ts

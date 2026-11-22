@@ -95,7 +95,7 @@ def build_scene_data(project, frame_offset: int = 1, sensor_width_mm: float = 36
                      pixel_aspect=info.pixel_aspect),
         frame_range=dict(start=int(fs), end=int(fe), blender_start=int(fs) + frame_offset,
                          blender_end=int(fe) + frame_offset, frame_offset=frame_offset,
-                         frame_step=project.settings.frame_step),
+                         frame_step=(sol.frames[1] - sol.frames[0]) if len(sol.frames) > 1 else 1),
         intrinsics=dict(focal_px=intr["f"], cx_px=intr["cx"], cy_px=intr["cy"], k1=intr["k1"], k2=intr["k2"],
                         distortion_model="polynomial_radial_k1k2 (OpenCV/Blender compatible, normalised coords)",
                         sensor_width_mm=sensor_width_mm, sensor_fit="HORIZONTAL", focal_mm=lens_mm(intr["f"]),

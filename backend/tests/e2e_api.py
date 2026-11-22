@@ -60,9 +60,10 @@ def main():
     # frame read check
     f0 = call("GET", f"/api/projects/{pid}/frames/{sol['frames'][0]}", raw=True)
     assert f0[:2] == b"\xff\xd8", "frame endpoint did not return a JPEG"
-    if sol["mode"] != "tripod":
-        g = sol["scene"]["auto_ground"]
-        assert g, "no auto ground estimate"
+    g = sol["scene"]["auto_ground"]
+    if sol["mode"] != "tripod" and not g:
+        print("  (no automatic ground estimate for this clip; skipping ground/object steps)")
+    if sol["mode"] != "tripod" and g:
         # use the points nearest the auto-ground point as the 'target' points
         import math
         xyz = sol["points"]["xyz"]

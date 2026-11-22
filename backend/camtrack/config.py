@@ -23,7 +23,7 @@ class AnalysisSettings:
     frame_start: Optional[int] = None   # inclusive, original frame numbers
     frame_end: Optional[int] = None     # inclusive
     processing_width: int = 0           # 0 = auto (long edge 1280, never upscaled)
-    frame_step: int = 1                 # track every Nth frame (1 = every frame)
+    frame_step: int = 0                 # track every Nth frame; 0 = auto (about 30 fps, at most 400 frames)
     # --- feature tracking ---
     detection_quality: str = "standard"  # draft / standard / high
     max_points: int = 3000              # max simultaneous tracked features
@@ -57,7 +57,7 @@ class AnalysisSettings:
         s.distortion = s.distortion if s.distortion in DISTORTION_MODES else "k1"
         s.detection_quality = s.detection_quality if s.detection_quality in QUALITY_PRESETS else "standard"
         s.processing_width = max(0, int(s.processing_width))
-        s.frame_step = max(1, min(10, int(s.frame_step)))
+        s.frame_step = max(0, min(10, int(s.frame_step)))
         s.max_points = max(100, min(20000, int(s.max_points)))
         s.min_track_length = max(3, min(500, int(s.min_track_length)))
         s.tracking_sensitivity = float(min(1.0, max(0.0, float(s.tracking_sensitivity))))
@@ -87,3 +87,19 @@ QUALITY_PARAMS = {
     "standard": dict(quality=0.005, min_dist=10, win=21, levels=4, redetect_every=3),
     "high":     dict(quality=0.002, min_dist=7, win=25, levels=5, redetect_every=1),
 }
+
+
+AUTO_TARGET_FPS = 30.0
+AUTO_MAX_FRAMES = 400
+
+
+def effective_frame_step(settings: "AnalysisSettings", fps: float, n_frames: int) -> int:
+    """Resolve frame_step. 0 (auto) tracks ~30 fps and caps the clip at ~400 tracked frames,
+    because solve time grows steeply with the number of frames while camera motion between
+    consecutive 60 fps frames is tiny. Explicit values (1..10) are used as given."""
+    if settings.frame_step >= 1:
+        return settings.frame_step
+    step = max(1, int(round(fps / AUTO_TARGET_FPS)))
+    while n_frames / step > AUTO_MAX_FRAMES and step < 10:
+        step += 1
+    return step

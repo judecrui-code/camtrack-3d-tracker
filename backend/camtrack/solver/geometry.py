@@ -217,3 +217,77 @@ def ransac_plane(pts: np.ndarray, thresh: float, iters: int = 500, rng=None):
         return None
     c, nrm, rms = fit_plane(pts[best])
     return c, nrm, best
+
+
+# ---------------------------------------------------------------------------
+# Crash-proof robust estimators.
+# OpenCV's USAC/MAGSAC can raise cv2.error (e.g. "!model.empty() in setModelParameters")
+# on degenerate samples on some builds. Every use goes through these wrappers: validate
+# input, try USAC, fall back to classic RANSAC, and report "no model" as (None, None).
+# ---------------------------------------------------------------------------
+def _clean_pair(a, b, min_pts):
+    a = np.ascontiguousarray(a, np.float64).reshape(-1, 2)
+    b = np.ascontiguousarray(b, np.float64).reshape(-1, 2)
+    ok = np.isfinite(a).all(1) & np.isfinite(b).all(1)
+    if ok.sum() < min_pts:
+        return None
+    # no spread at all -> every sample is degenerate
+    if np.ptp(a[ok], axis=0).max() < 1e-9 or np.ptp(b[ok], axis=0).max() < 1e-9:
+        return None
+    return a, b, ok
+
+
+def _expand_mask(mask, ok):
+    if mask is None:
+        return None
+    full = np.zeros((len(ok), 1), np.uint8)
+    full[ok, 0] = np.asarray(mask).reshape(-1)[: int(ok.sum())]
+    return full
+
+
+def _try(methods, fn):
+    for m in methods:
+        try:
+            r = fn(m)
+            if r[0] is not None and r[1] is not None:
+                return r
+        except cv2.error:
+            continue
+    return None, None
+
+
+def robust_fundamental(a, b, thresh, conf=0.999, iters=2000):
+    c = _clean_pair(a, b, 8)
+    if c is None:
+        return None, None
+    a, b, ok = c
+    F, mask = _try([cv2.USAC_MAGSAC, cv2.FM_RANSAC],
+                   lambda m: cv2.findFundamentalMat(a[ok], b[ok], m, thresh, conf, iters))
+    if F is None or F.shape[0] < 3 or not np.isfinite(F).all():
+        return None, None
+    return F[:3], _expand_mask(mask, ok)
+
+
+def robust_essential(xa, xb, thresh, conf=0.999):
+    """Essential matrix on normalised coordinates (identity camera matrix)."""
+    c = _clean_pair(xa, xb, 5)
+    if c is None:
+        return None, None
+    a, b, ok = c
+    E, mask = _try([cv2.USAC_MAGSAC, cv2.RANSAC],
+                   lambda m: cv2.findEssentialMat(a[ok], b[ok], np.eye(3), m, conf, thresh))
+    if E is None or E.shape[0] < 3 or not np.isfinite(E).all():
+        return None, None
+    return E[:3], _expand_mask(mask, ok)
+
+
+def robust_homography(a, b, thresh, conf=0.999, iters=2000):
+    c = _clean_pair(a, b, 4)
+    if c is None:
+        return None, None
+    a, b, ok = c
+    H, mask = _try([cv2.USAC_MAGSAC, cv2.RANSAC],
+                   lambda m: cv2.findHomography(a[ok], b[ok], m, thresh, maxIters=iters, confidence=conf))
+    if H is None or not np.isfinite(H).all():
+        return None, None
+    return H, _expand_mask(mask, ok)

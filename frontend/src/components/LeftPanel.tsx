@@ -150,8 +150,9 @@ export default function LeftPanel(p: Props) {
               {![640, 960, 1280, 1920, 2560, 3840].includes(info.width) && <option value={info.width}>{info.width}px (full)</option>}
             </select>
           </Row>
-          <Row label="Frame sampling" hint="Track every Nth frame. 1 = every frame (recommended).">
+          <Row label="Frame sampling" hint="Track every Nth frame. Auto picks about 30 fps and caps long clips at ~400 frames; Blender interpolates the camera between solved frames.">
             <select value={s.frame_step} onChange={(e) => set("frame_step", parseInt(e.target.value))}>
+              <option value={0}>Auto (~30 fps, max 400 frames)</option>
               {[1, 2, 3, 4, 5].map((v) => (
                 <option key={v} value={v}>{v === 1 ? "Every frame" : `Every ${v} frames`}</option>
               ))}

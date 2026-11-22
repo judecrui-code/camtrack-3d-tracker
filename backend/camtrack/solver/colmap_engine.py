@@ -49,8 +49,10 @@ def solve_colmap(project, ts_native, settings: AnalysisSettings, rep, exclude=No
     try:
         rep.stage("COLMAP: writing frames", 0.0, 0.1)
         frames = []
-        total = (end - start) // settings.frame_step + 1
-        for k, (n, fr) in enumerate(iter_frames(project.video_path, start, end, settings.frame_step)):
+        from ..config import effective_frame_step
+        step = effective_frame_step(settings, info.fps, end - start + 1)
+        total = (end - start) // step + 1
+        for k, (n, fr) in enumerate(iter_frames(project.video_path, start, end, step)):
             rep.check()
             if scale != 1.0:
                 fr = cv2.resize(fr, (pw, ph), interpolation=cv2.INTER_AREA)

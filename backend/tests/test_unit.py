@@ -11,6 +11,8 @@ from camtrack.solver.bundle import BAProblem, bundle_adjust, refine_points  # no
 from camtrack.solver.geometry import (bearings, project, ransac_rotation, triangulate_multiview,  # noqa: E402
                                       undistort_normalized, rot_to_quat, quat_to_rot)
 from camtrack.export.scene_data import FLIP  # noqa: E402
+from camtrack.solver.geometry import robust_essential, robust_fundamental, robust_homography  # noqa: E402
+from camtrack.config import AnalysisSettings, effective_frame_step  # noqa: E402
 
 
 def _cams(C=40):
@@ -100,6 +102,47 @@ def test_quaternion_roundtrip_and_blender_camera_axes():
     Rbl = Rc.T @ FLIP
     assert np.allclose(Rbl @ [0, 0, -1], [0, 1, 0])   # viewing direction +Y
     assert np.allclose(Rbl @ [0, 1, 0], [0, 0, 1])    # camera up = world up
+
+
+def test_robust_estimators_never_raise_on_degenerate_input():
+    rng = np.random.default_rng(5)
+    base = rng.uniform(0, 700, (200, 2))
+    line = np.c_[np.linspace(0, 500, 100), np.linspace(0, 500, 100)]
+    nan = np.where(base > 650, np.nan, base)
+    cases = [(base, base.copy()), (base, base + 1e-4), (line, line + 3), (np.tile([[100., 100.]], (60, 1)),
+             np.tile([[101., 100.]], (60, 1))), (base[:3], base[:3]), (nan, base + 1), (base[:0], base[:0]),
+             (np.full((50, 2), np.inf), base[:50])]
+    for a, b in cases:
+        for fn, thr in ((robust_fundamental, 1.5), (robust_essential, 0.002), (robust_homography, 1.5)):
+            M, mask = fn(a, b, thr)           # must not raise
+            assert (M is None) == (mask is None)
+            if mask is not None:
+                assert len(mask) == len(a)
+
+
+def test_robust_estimators_still_find_correct_models():
+    rng = np.random.default_rng(6)
+    X = rng.uniform([-2, -2, 5], [2, 2, 12], (300, 3))
+    R = cv2.Rodrigues(np.array([0.02, 0.05, 0.01]))[0]
+    t = np.array([0.3, 0.0, 0.05])
+    xa = X[:, :2] / X[:, 2:]
+    Xc = X @ R.T + t
+    xb = Xc[:, :2] / Xc[:, 2:]
+    xb[:30] += rng.uniform(-0.2, 0.2, (30, 2))            # outliers
+    E, mask = robust_essential(xa, xb, 1e-3)
+    assert E is not None and mask[30:].mean() > 0.95
+    F, mask = robust_fundamental(xa * 900 + 640, xb * 900 + 640, 1.0)
+    assert F is not None and mask[30:].mean() > 0.9
+
+
+def test_auto_frame_step():
+    s = AnalysisSettings.from_dict({})
+    assert s.frame_step == 0
+    assert effective_frame_step(s, 30, 120) == 1           # 30 fps short clip: every frame
+    assert effective_frame_step(s, 60, 600) == 2           # 60 fps: ~30 fps
+    assert effective_frame_step(s, 59.94, 1101) == 3       # long 60 fps clip stays under 400 tracked frames
+    assert 1101 / effective_frame_step(s, 59.94, 1101) <= 400
+    assert effective_frame_step(AnalysisSettings.from_dict({"frame_step": 4}), 60, 1101) == 4  # explicit wins
 
 
 if __name__ == "__main__":
