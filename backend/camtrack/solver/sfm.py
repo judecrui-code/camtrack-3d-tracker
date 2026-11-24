@@ -120,6 +120,15 @@ class SequentialSfM:
         self.N = len(self.frames)
         fpos = {f: i for i, f in enumerate(self.frames)}
         min_len = max(3, min(settings.min_track_length, max(3, self.N // 2)))
+        self.min_len_requested = min_len
+        # Sparse footage (faint texture, heavy noise) cannot produce long tracks. Rather than starve the
+        # solver, accept shorter ones until there are at least ~200 observations per frame (never below 4).
+        while min_len > 4:
+            cand = ts.usable(min_len, exclude_ids)
+            if sum(len(t.frames) for t in cand) / max(1, self.N) >= 200:
+                break
+            min_len -= 1
+        self.min_len_used = min_len
         self.tracks = ts.usable(min_len, exclude_ids)
         if len(self.tracks) < 20:
             raise SolveFailed(f"Only {len(self.tracks)} usable tracks (min length {min_len}). "
@@ -151,7 +160,9 @@ class SequentialSfM:
         # Weak MAP prior on focal length: a 60 deg horizontal FOV (~31mm full-frame equivalent).
         # Only matters when the footage does not constrain focal (e.g. planar scene + pure translation);
         # its weight is tiny compared to the reprojection term of any well-conditioned solve.
-        self.focal_prior = self.w / (2 * np.tan(np.radians(30)))
+        # (measured across the LONG edge: on phone portrait video the width is the short side)
+        self.long_edge = float(max(self.w, self.h))
+        self.focal_prior = self.long_edge / (2 * np.tan(np.radians(30)))
         self.focal_prior_weight = 20.0
 
     # ------------------------------------------------------------------ utils
@@ -293,7 +304,7 @@ class SequentialSfM:
                 best = frac(fcands[0])
             else:
                 # coarse log-spaced focal search (FOV 8..120 deg) then local refinement
-                grid = self.w / (2 * np.tan(np.radians(np.geomspace(8, 120, 28)) / 2))
+                grid = self.long_edge / (2 * np.tan(np.radians(np.geomspace(8, 120, 28)) / 2))
                 vals = [frac(f) for f in grid]
                 k = int(np.argmax(vals))
                 lo, hi = grid[min(k + 1, len(grid) - 1)], grid[max(k - 1, 0)]
@@ -628,14 +639,18 @@ class SequentialSfM:
         if self.s.focal_length_px:
             return [self.s.focal_length_px * self.ts.scale], False
         if self.s.focal_length_mm:
-            return [self.s.focal_length_mm / self.s.sensor_width_mm * self.w], False
+            # 35mm-style focal length: the sensor size refers to the image's long edge
+            return [self.s.focal_length_mm / self.s.sensor_width_mm * self.long_edge], False
         fovs = [20, 35, 50, 65, 80, 100]
-        return [self.w / (2 * np.tan(np.radians(fv) / 2)) for fv in fovs], True
+        return [self.long_edge / (2 * np.tan(np.radians(fv) / 2)) for fv in fovs], True
 
     def solve(self) -> Solution:
         rep = self.report
         kfs = self.select_keyframes()
         self.log(f"{self.T} usable tracks, {self.M} observations, {self.N} frames, {len(kfs)} keyframes")
+        if self.min_len_used < self.min_len_requested:
+            self.log(f"Sparse footage: accepting tracks of {self.min_len_used}+ frames "
+                     f"(requested minimum {self.min_len_requested}) to keep enough observations per frame")
         fcands, estimate_f = self.focal_candidates()
         f_nominal = fcands[len(fcands) // 2] if estimate_f else fcands[0]
         self._reset(f_nominal, *self._fixed_dist())
@@ -694,6 +709,9 @@ class SequentialSfM:
         trials.sort(key=lambda t: t["score"])
         best = trials[0]
         self.focal_sweep = [(t["f0"], t["f"], t["rmse"]) for t in trials]
+        if estimate_f and not self.s.variable_focal:
+            # (skipped for zoom shots: a single frozen lens cannot describe a lens that changes over the clip)
+            best = self._confirm_focal(trials, kfs, use_h, best)
         self.log(f"Selected initialisation: f={best['f']:.1f}px ({best['hyp']['kind']}), rmse {best['rmse']:.3f}px")
 
         # ---- full keyframe reconstruction ----
@@ -920,6 +938,48 @@ class SequentialSfM:
         cs = pose_center(seg["rv"][seg_f], seg["tv"][seg_f])
         t = target - s_ * R @ cs
         return s_, R, t
+
+    def _confirm_focal(self, trials, kfs, use_h, best):
+        """The short trials above cannot tell focal lengths apart when the opening frames are mostly
+        rotation (a pan or tilt). Re-test the leading *distinct* candidates over a much longer stretch with
+        the lens frozen at each candidate: the correct lens keeps registering new frames, a wrong one
+        stalls or accumulates error. Candidates are ranked by how much of the stretch they register, then
+        by reprojection error."""
+        top = []
+        for t in trials:
+            if all(abs(np.log(t["f"] / g["f"])) > 0.06 for g in top):
+                top.append(t)
+            if len(top) == 4:
+                break
+        if len(top) < 2:
+            return best
+        results = []
+        for t in top:
+            self._check()
+            self._reset(t["f"], *self._fixed_dist())
+            hyps, _ = self.two_view(t["a"], t["b"], use_h=use_h)
+            if not hyps:
+                continue
+            hyp = min(hyps, key=lambda h: 0 if h["kind"] == t["hyp"]["kind"] else 1)
+            try:
+                nreg, ntar, rmse = self.incremental(kfs, t["a"], t["b"], hyp, t["f"], window=40, opt_focal=False)
+            except np.linalg.LinAlgError:
+                continue
+            results.append((nreg / max(1, ntar), rmse, t))
+            self.log(f"  long test f={t['f']:.0f}px: registered {nreg}/{ntar} keyframes, rmse {rmse:.3f}px")
+        if not results:
+            return best
+        top_frac = max(r[0] for r in results)
+        # Among candidates that register (nearly) as much as the best, take the lowest error. When the
+        # scene cannot reveal the lens at all (a flat floor: every candidate registers everything with
+        # near-identical error) the weak prior breaks the tie, exactly as in the short trials. It must not
+        # be dropped here, or the winner is decided by noise (787 px chosen for a true 1000 px on the
+        # synthetic flat clip).
+        ok = [r for r in results if r[0] >= top_frac - 0.05]
+        chosen = min(ok, key=lambda r: r[1] + 0.1 * abs(np.log(r[2]["f"] / self.focal_prior)))[2]
+        if chosen is not best:
+            self.log(f"Long-stretch test changed the lens estimate: {best['f']:.0f}px -> {chosen['f']:.0f}px")
+        return chosen
 
     def register_remaining(self, kfs):
         kset = set(kfs)

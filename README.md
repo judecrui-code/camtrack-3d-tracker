@@ -171,10 +171,22 @@ Open it in Blender via **Scripting → Open `build_scene.py` → Run Script**, o
   On a long walking clip with a plain floor, this raised the share of tracks within 1 px of truth
   during a corner turn from 36% to 72–82%.
 - **Corner-strength floor:** blurred or dark frames (whip pans, a covered lens) no longer spawn
-  thousands of noise "corners".
+  thousands of noise "corners". The floor is deliberately low (6% of recent good-frame strength): a
+  stricter one discarded the faint texture of a plain epoxy floor on a real phone clip (142 vs 324
+  usable tracks in the same frames).
+- **Contrast boost:** frames are contrast-equalised (CLAHE) before detection and tracking, which brings
+  out the faint texture of plain painted or polished floors: about twice the usable tracks in the plain
+  stretch of that clip.
+- **Fast re-acquisition:** matching lost tracks to new corners uses spatial search trees. It had been
+  80% of tracking time on faint texture (203 s for 125 frames, now about 22 s). Every lost track stays a
+  candidate however short: skipping fragments under 5 frames made it faster still, but broke solves on
+  noisy or blurred clips (a dead-zone test clip went from 0.14% to 7% path error), because stitched short
+  fragments are what keep such footage solvable.
 - **Gap bridging:** about three times a second, the tracker also extracts SIFT features, which can be
-  matched across large viewpoint changes. Where frame-to-frame tracking breaks (a dead zone), link
-  frames within about 4 s on either side are matched directly to each other. Each match is checked
+  matched across large viewpoint changes. Where frame-to-frame tracking breaks (a dead zone) *or is too
+  weak to constrain the camera* (fewer than 150 usable tracks, or tracks bunched into a thin strip of the
+  image, such as a plain floor with only a pillar along one edge), link frames within about 4 s on either
+  side are matched directly to each other. Each match is checked
   against the epipolar geometry and a cycle-consistency test. These link tracks tie the footage after
   a dead zone to the 3D points before it. They are only used across detected breaks, so footage that
   tracks continuously is solved exactly as before.
@@ -197,7 +209,11 @@ Open it in Blender via **Scripting → Open `build_scene.py` → Run Script**, o
   reconstruction with focal-length bundle adjustment; the lowest-error one wins. The spread of the
   sweep detects poorly constrained focal length, which triggers a warning. A weak MAP prior (60°
   horizontal FOV) only matters when the footage carries no focal information; when the data
-  constrains focal (orbit, indoor, tripod), the data wins (≤ 0.6% error in tests).
+  constrains focal (orbit, indoor, tripod), the data wins (≤ 0.6% error in tests). The prior and the
+  hypotheses are measured across the image's **long edge**, so phone portrait video is handled like
+  landscape. The short trials cannot separate lenses when the opening frames are mostly pan or tilt, so
+  the leading distinct candidates are re-tested over a much longer stretch with the lens frozen, ranked
+  by how many keyframes they register and then by error.
 - **Best-next-frame registration** (as in COLMAP): the solver always adds the unregistered keyframe that
   sees the most reconstructed 3D points, so one hard frame cannot strand everything behind it. Pose
   estimation is PnP RANSAC (SQPnP) with LM refinement. It tolerates a low share of correct matches
@@ -276,17 +292,17 @@ Results (1280×720, 120 frames each; the two long clips have 600; default settin
 
 | Scenario | Mode chosen | Solved frames | Mean reproj. error | Focal error | Position error (% of path) | Rotation error | Notes |
 |---|---|---|---|---|---|---|---|
-| forward | typical | 120/120 | 0.279 px | 0.89% | 0.010% | 0.010° | focal weakly observable in a forward dolly (warned); 9151 pts, 18+55s |
-| sideways | typical | 120/120 | 0.187 px | 0.03% | 0.006% | 0.003° | 5713 pts, 17+45s |
-| orbit | typical | 120/120 | 0.323 px | 0.06% | 0.015% | 0.025° | 7980 pts, 36+50s |
-| flat | typical | 120/120 | 0.333 px | 5.40% | 0.494% | 0.011° | planar scene + constant orientation: focal not observable (warned; weak prior); 6914 pts, 13+201s |
-| outdoor | typical | 120/120 | 0.164 px | 0.11% | 0.029% | 0.003° | independently moving car: 33 of 4653 points on it; 4653 pts, 24+60s |
-| indoor | typical | 120/120 | 0.227 px | 0.38% | 0.026% | 0.021° | barrel distortion recovered: k1 -0.0781 (true -0.08); 5686 pts, 14+73s |
-| lowtexture | typical | 120/120 | 0.517 px | 1.16% | 0.352% | 0.110° | many short tracks; slower; 1486 pts, 191+55s |
-| tripod | tripod | 120/120 | 0.197 px | 0.07% | n/a (no translation) | 0.015° | auto-detected rotation-only; 6300 pts, 15+44s |
-| zoom | typical | 120/120 | 0.262 px | 3.29% | 0.036% | 0.104° | variable focal 930-1446px (true 900-1400px); 6668 pts, 14+62s |
-| longwalk | typical | 540/600 | 0.357 px | 0.08% | 0.164% | 0.525° | 20 s walk with 2 s dead zone (frames 300-359 interpolated); floor 0.16° off; 18166 pts, 78+289s |
-| longwalk_nogap | typical | 600/600 | 0.368 px | 0.27% | 0.141% | 0.217° | 20 s walk round a corner, no dead zone; floor 1.71° off; 18981 pts, 68+416s |
+| forward | typical | 120/120 | 0.278 px | 1.46% | 0.017% | 0.012° | focal weakly observable in a forward dolly (warned); 11695 pts, 14+51s |
+| sideways | typical | 120/120 | 0.187 px | 0.10% | 0.009% | 0.010° | 6109 pts, 17+37s |
+| orbit | typical | 120/120 | 0.315 px | 0.01% | 0.017% | 0.029° | 12067 pts, 19+69s |
+| flat | typical | 120/120 | 0.436 px | 3.49% | 0.331% | 0.007° | planar scene + constant orientation: focal not observable (warned; weak prior); 8482 pts, 19+139s |
+| outdoor | typical | 120/120 | 0.168 px | 0.05% | 0.041% | 0.006° | independently moving car: 27 of 4734 points on it; 4734 pts, 18+63s |
+| indoor | typical | 120/120 | 0.239 px | 0.54% | 0.057% | 0.033° | barrel distortion recovered: k1 -0.0782 (true -0.08); 5885 pts, 13+52s |
+| lowtexture | typical | 120/120 | 0.600 px | 3.44% | 0.245% | 0.164° | many short tracks; slower; 2452 pts, 26+17s |
+| tripod | tripod | 120/120 | 0.214 px | 0.13% | n/a (no translation) | 0.028° | auto-detected rotation-only; 6957 pts, 11+36s |
+| zoom | typical | 120/120 | 0.257 px | 7.34% | 0.053% | 0.207° | variable focal 967-1504px (true 900-1400px); 7212 pts, 12+48s |
+| longwalk | typical | 540/600 | 0.390 px | 0.16% | 0.136% | 0.517° | 20 s walk with 2 s dead zone (frames 300-359 interpolated); floor 2.82° off; 23264 pts, 81+289s |
+| longwalk_nogap | typical | 600/600 | 0.384 px | 0.71% | 0.286% | 0.201° | 20 s walk round a corner, no dead zone; floor 0.67° off; 24753 pts, 62+665s |
 
 **Blender round-trip** (`tests/test_blender.py`, run with Blender's Python or the `bpy` module):
 1. Unzips an export and runs `build_scene.py` inside Blender 5.0.
@@ -329,7 +345,7 @@ To get `bpy` without a Blender install: `pip install bpy` into a Python 3.11 ven
 | Frame sampling | every frame | Track every N-th frame; Blender interpolates between keys |
 | Detection quality | Standard | Draft / Standard / High (corner threshold, spacing, LK window, pyramid) |
 | Max points | 3000 | Maximum simultaneously tracked features |
-| Min track length | 8 frames | Shorter tracks are not used for the solve |
+| Min track length | 8 frames | Shorter tracks are not used for the solve (lowered automatically, down to 4, on sparse footage) |
 | Sensitivity | 0.5 | Higher accepts more and weaker features with looser checks |
 | Focal length | Estimate | Or known focal in px, or mm + sensor width |
 | Variable focal | off | Per-frame focal for zoom shots |
@@ -341,10 +357,22 @@ To get `bpy` without a Blender install: `pip install bpy` into a Python 3.11 ven
 
 ## Limitations (measured or known, not hidden)
 
-- **Validated on synthetic footage only.** This environment had no access to real sample footage.
-  The synthetic clips include compression, noise, blur, distortion, low texture and a moving object,
-  but not motion blur, rolling shutter, lighting changes, reflections, or real lens behaviour.
-  Expect real footage to give higher errors than the table above.
+- **Mostly validated on synthetic footage.** The accuracy figures above come from synthetic clips, where
+  the true camera is known. They include compression, noise, blur, distortion, low texture and a moving
+  object, but not rolling shutter, lighting changes, reflections, or real lens behaviour. Expect real
+  footage to give higher errors than the table above. One real clip (an 18 s portrait iPhone video, mostly
+  plain glossy floor with reflections, a pillar and a turn) was used to find and fix problems; with no
+  true camera for it, it was judged by reprojection error and by drawing the detected floor onto the
+  frames. It solves all 552 frames. Its last 67 frames form a separate segment, joined to the rest through
+  21 frames located in both parts (measured, but weakly constrained), and its lens is uncertain (see
+  below).
+- **Low parallax makes the lens unmeasurable.** Pan-and-tilt footage with little sideways movement cannot
+  pin down focal length, and the estimate trades off against lens distortion. On that clip, estimates
+  ranged from about 1,390 px (a standard phone 26 mm lens, supplied) to about 1,850 px (estimated), with
+  opposite-signed distortion, and both fit the footage. **Enter the real focal length when you know it**
+  (*Known (mm)*: a 35mm-equivalent value such as 26 for an iPhone main camera at 1x, 52 at 2x; the sensor
+  size refers to the image's long edge, 36 by default). Supplying it made the clip register 161 of 174
+  keyframes on the first pass, against 75 with the lens estimated.
 - **Focal length can be unobservable.** This happens with pure translation over a single plane, and
   is weak for forward dollies. CamTrack warns, and the weak prior keeps the result plausible (see the
   flat and forward rows above). Enter the real focal length when you know it.

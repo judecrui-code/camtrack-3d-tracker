@@ -183,7 +183,7 @@ export default function LeftPanel(p: Props) {
               value={s.focal_length_px != null ? "px" : s.focal_length_mm != null ? "mm" : "auto"}
               onChange={(e) => {
                 const v = e.target.value;
-                p.setSettings({ ...s, focal_length_px: v === "px" ? Math.round(info.width * 0.9) : null, focal_length_mm: v === "mm" ? 35 : null });
+                p.setSettings({ ...s, focal_length_px: v === "px" ? Math.round(info.width * 0.9) : null, focal_length_mm: v === "mm" ? 26 : null });
               }}
             >
               <option value="auto">Estimate</option>
@@ -201,7 +201,7 @@ export default function LeftPanel(p: Props) {
               <Row label="Focal (mm)">
                 <input type="number" value={s.focal_length_mm} onChange={(e) => set("focal_length_mm", parseFloat(e.target.value))} />
               </Row>
-              <Row label="Sensor width (mm)">
+              <Row label="Sensor long edge (mm)" hint="Sensor size along the longer image side. 36 = full-frame equivalent, which is what phone '35mm equivalent' focal lengths use.">
                 <input type="number" value={s.sensor_width_mm} onChange={(e) => set("sensor_width_mm", parseFloat(e.target.value))} />
               </Row>
             </>

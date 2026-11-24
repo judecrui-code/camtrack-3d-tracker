@@ -31,7 +31,7 @@ from ..footage import iter_frames, processing_size
 from ..solver.geometry import robust_fundamental
 
 
-@dataclass
+@dataclass(eq=False)   # identity comparison: Tracks are removed from lists by the thousand
 class Track:
     id: int
     frames: list = field(default_factory=list)
@@ -134,6 +134,19 @@ class FeatureTracker:
         self.max_points = settings.max_points
         self.anchor_max_age = 30
         self.anchor_policy = "end"
+        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # Fraction of recent good-frame corner strength below which a corner is noise. Low on purpose: plain
+        # painted/epoxy floors have only faint texture, and a stricter floor discarded it (142 -> 324 usable
+        # tracks on the garage clip when relaxed); the forward-backward and anchor checks reject real noise.
+        # Every lost track is a re-acquisition candidate, however short. Skipping fragments under 5 frames
+        # made re-acquisition 11x cheaper on its own but broke solves on noisy / blurred clips (a dead-zone
+        # clip went from 0.16% to 7% path error): stitched short fragments are what keep such footage solvable.
+        # The speed comes from the KD-tree search, not from the filter.
+        self.reacq_min_len = 1
+        self.strength_floor = 0.06
+        # Contrast-limited adaptive histogram equalisation before detection and tracking: brings out the faint
+        # texture of plain surfaces (about 2x the usable tracks in the same stretch)
+        self.use_clahe = True
         self.anchor_noise_factor = 3.0
         self._strength_hist: list[float] = []
         # tight appearance check: a track whose position no longer matches its reference template to within
@@ -180,6 +193,8 @@ class FeatureTracker:
             if scale != 1.0:
                 frame = cv2.resize(frame, (self.w, self.h), interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if self.use_clahe:
+                gray = self._clahe.apply(gray)
             seq_frames.append(n)
             if linker is not None:
                 linker.maybe_add(k, n, gray, frame, force=(n + step > end))
@@ -366,7 +381,7 @@ class FeatureTracker:
         if len(self._strength_hist) > 200:
             self._strength_hist.pop(0)
         ref = float(np.percentile(self._strength_hist, 75))
-        keep = strength >= 0.12 * ref
+        keep = strength >= self.strength_floor * ref
         if (~keep).any():
             stats["weak_corners_rejected"] = stats.get("weak_corners_rejected", 0) + int((~keep).sum())
         return corners[keep]
@@ -416,40 +431,53 @@ class FeatureTracker:
         return drop
 
     def _reacquire(self, corners, desc, valid, lost, active, history, n):
-        """Match new detections to recently lost tracks. Returns {corner_index: Track}."""
-        if not lost:
+        """Match new detections to recently lost tracks. Returns {corner_index: Track}.
+
+        Lost tracks are grouped by the frame they were lost in, so the motion of the surviving
+        neighbours is computed once per group (KD-tree), and candidate corners come from a radius
+        query instead of a scan of every corner. Tracks that lived fewer than 5 frames are not worth
+        re-acquiring (and on faint texture there are tens of thousands of them)."""
+        if not lost or len(corners) == 0:
             return {}
+        from scipy.spatial import cKDTree
+        vidx = np.where(valid)[0]
+        if len(vidx) == 0:
+            return {}
+        ctree = cKDTree(corners[vidx])
         cur = {t.id: t.xy[-1] for t in active}
-        out = {}
-        taken = set()
+        by_frame: dict[int, list] = {}
         for t in lost:
-            f_l = t.frames[-1]
+            if t.desc is not None and len(t.frames) >= self.reacq_min_len:
+                by_frame.setdefault(t.frames[-1], []).append(t)
+        out, taken = {}, set()
+        for f_l, group in by_frame.items():
             ref = history.get(f_l)
-            if ref is None or t.desc is None:
+            if ref is None:
                 continue
-            # predict position from motion of nearby tracks that survived since f_l
-            common = [(ref[i], cur[i]) for i in ref.keys() & cur.keys()]
-            if len(common) < 6:
+            ids = [i for i in ref if i in cur]
+            if len(ids) < 6:
                 continue
-            a = np.array([c[0] for c in common])
-            b = np.array([c[1] for c in common])
-            last = np.array(t.xy[-1])
-            near = np.argsort(np.linalg.norm(a - last, axis=1))[:8]
-            pred = last + np.median(b[near] - a[near], axis=0)
+            a = np.array([ref[i] for i in ids])
+            b = np.array([cur[i] for i in ids])
+            lasts = np.array([t.xy[-1] for t in group])
+            _, nn = cKDTree(a).query(lasts, k=min(8, len(a)))
+            nn = nn.reshape(len(group), -1)
+            preds = lasts + np.median(b[nn] - a[nn], axis=1)   # predicted position of each lost track
             radius = 6.0 + 0.5 * (n - f_l)
-            d = np.linalg.norm(corners - pred, axis=1)
-            cand = np.where((d < radius) & valid)[0]
-            if len(cand) == 0:
-                continue
-            hd = self._hamming(desc[cand], t.desc)
-            order = np.argsort(hd)
-            best = cand[order[0]]
-            if hd[order[0]] > self.hamming_reacq or best in taken:
-                continue
-            if len(order) > 1 and hd[order[1]] < hd[order[0]] * 1.15 + 2:
-                continue  # ambiguous
-            out[int(best)] = t
-            taken.add(best)
+            for t, pred in zip(group, preds):
+                cand = ctree.query_ball_point(pred, radius)
+                if not cand:
+                    continue
+                cand = vidx[np.asarray(cand)]
+                hd = self._hamming(desc[cand], t.desc)
+                order = np.argsort(hd)
+                best = cand[order[0]]
+                if hd[order[0]] > self.hamming_reacq or best in taken:
+                    continue
+                if len(order) > 1 and hd[order[1]] < hd[order[0]] * 1.15 + 2:
+                    continue  # ambiguous
+                out[int(best)] = t
+                taken.add(best)
         return out
 
 
@@ -465,7 +493,7 @@ def run_tracking(video_path: str, info, settings: AnalysisSettings, report) -> T
         report.log(f"Auto frame sampling: tracking every {step} frame(s) "
                    f"({(end - start) // step + 1} of {end - start + 1} frames; {info.fps / step:.1f} fps effective)")
     tr = FeatureTracker(settings, pw, ph)
-    from .linking import LinkFeatureCollector, build_link_tracks, connectivity_gaps
+    from .linking import LinkFeatureCollector, build_link_tracks, connectivity_gaps, merge_ranges, weak_stretches
     eff_fps = max(1.0, info.fps / step)
     linker = LinkFeatureCollector(every=max(1, int(round(eff_fps / 3))), proc_w=pw, proc_h=ph)
     ts = tr.run(video_path, start, end, step, scale, report, linker=linker)
@@ -474,7 +502,9 @@ def run_tracking(video_path: str, info, settings: AnalysisSettings, report) -> T
     if hasattr(report, "log"):
         report.log(f"Collected {len(linker.frames)} wide-baseline link frames (SIFT)")
     window = int(round(4.0 * eff_fps))
-    gaps = connectivity_gaps(ts.frames, ts.tracks)
+    breaks = connectivity_gaps(ts.frames, ts.tracks)
+    weak = weak_stretches(ts.frames, ts.tracks, ph)
+    gaps = merge_ranges(breaks + weak, pad=step)
     link_tracks, lstats = [], {"link_tracks": 0, "verified_matches": 0, "pairs_linked": 0, "pairs_tested": 0}
     link_seq = []
     if gaps:
@@ -491,10 +521,12 @@ def run_tracking(video_path: str, info, settings: AnalysisSettings, report) -> T
     ts.tracks.extend(link_tracks)
     ts.stats.update({f"link_{k}" if not k.startswith("link") else k: v for k, v in lstats.items()})
     ts.stats["link_seq_idx"] = link_seq
-    ts.stats["dead_zones"] = gaps
+    ts.stats["dead_zones"] = breaks
+    ts.stats["weak_stretches"] = weak
     if hasattr(report, "log") and gaps:
         report.log(f"Link tracks bridging tracking breaks: {lstats['link_tracks']} "
                    f"(from {lstats['verified_matches']} verified matches, {lstats['pairs_linked']}/{lstats['pairs_tested']} frame pairs)")
         for a, b in gaps:
-            report.log(f"Optical-flow tracking broke between frames {a} and {b}; bridging with link tracks")
+            kind = "broke" if any(x <= a and b <= y + step for x, y in breaks) else "is too sparse or lopsided"
+            report.log(f"Tracking {kind} in frames {a}-{b}; bridging it with wide-baseline link tracks")
     return ts

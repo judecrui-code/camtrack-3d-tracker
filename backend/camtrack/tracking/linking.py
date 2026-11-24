@@ -237,3 +237,57 @@ def connectivity_gaps(frames: list[int], tracks, min_shared: int = 12) -> list[t
         else:
             i += 1
     return gaps
+
+
+def weak_stretches(frames: list[int], tracks, proc_h: int, min_tracks: int = 150, min_cover: float = 0.35,
+                   min_len: int = 8, join: int = 6, min_frames: int = 4) -> list[tuple[int, int]]:
+    """Stretches where the footage is trackable but *poorly constrained*: very few usable tracks, or tracks
+    bunched into a thin strip of the image (e.g. a plain floor with only a pillar and a painted line along
+    one edge). Those frames cannot be placed reliably from their neighbours, so wide-baseline links should
+    bridge them just like a true dead zone. Returns (first_frame, last_frame) ranges."""
+    idx = {f: i for i, f in enumerate(frames)}
+    n = np.zeros(len(frames), np.int64)
+    ys = [[] for _ in frames]
+    for t in tracks:
+        if getattr(t, "dynamic", False) or len(t.frames) < min_len or getattr(t, "kind", "klt") == "link":
+            continue
+        for f, (x, y) in zip(t.frames, t.xy):
+            i = idx.get(f)
+            if i is not None:
+                n[i] += 1
+                ys[i].append(y)
+    weak = np.zeros(len(frames), bool)
+    for i, v in enumerate(ys):
+        if n[i] < min_tracks:
+            weak[i] = True
+        else:
+            lo, hi = np.percentile(v, [10, 90])
+            weak[i] = (hi - lo) / proc_h < min_cover
+    out, i = [], 0
+    while i < len(weak):
+        if weak[i]:
+            j = i
+            gap = 0
+            k = i
+            while k + 1 < len(weak) and gap <= join:        # tolerate short strong blips inside a weak stretch
+                k += 1
+                if weak[k]:
+                    j, gap = k, 0
+                else:
+                    gap += 1
+            if j - i + 1 >= min_frames:
+                out.append((frames[i], frames[j]))
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def merge_ranges(ranges: list[tuple[int, int]], pad: int = 0) -> list[tuple[int, int]]:
+    out: list[list[int]] = []
+    for a, b in sorted(ranges):
+        if out and a <= out[-1][1] + pad:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]

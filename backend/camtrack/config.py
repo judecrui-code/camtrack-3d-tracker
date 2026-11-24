@@ -33,8 +33,8 @@ class AnalysisSettings:
     solve_method: str = "auto"          # auto / typical / flat / tripod
     variable_focal: bool = False        # zoom shots: per-frame focal length
     focal_length_px: Optional[float] = None  # known focal in *original* pixels; None = estimate
-    focal_length_mm: Optional[float] = None  # alternative: focal in mm + sensor width
-    sensor_width_mm: float = 36.0
+    focal_length_mm: Optional[float] = None  # alternative: 35mm-style focal in mm (sensor size = image long edge)
+    sensor_width_mm: float = 36.0           # sensor size along the image's long edge (36 = full-frame equivalent)
     distortion: str = "k1"              # none / k1 / k1k2 / manual
     k1: float = 0.0                     # used when distortion == manual
     k2: float = 0.0
