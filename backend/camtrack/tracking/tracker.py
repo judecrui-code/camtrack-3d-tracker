@@ -46,6 +46,7 @@ class Track:
     end_reason: str = ""
     anchor_k: int = -1            # sequence index of the anchor (reference appearance) frame
     anchor_xy: tuple = (0.0, 0.0)
+    kind: str = "klt"             # "klt" (optical-flow track) or "link" (wide-baseline SIFT link track)
 
 
 class TrackSet:
@@ -69,6 +70,7 @@ class TrackSet:
             colors=np.array([t.color for t in self.tracks], np.uint8).reshape(-1, 3),
             dynamic=np.array([t.dynamic for t in self.tracks], bool),
             reacq=np.array([t.reacquired for t in self.tracks], np.int32),
+            link=np.array([t.kind == "link" for t in self.tracks], bool),
             seq_frames=np.asarray(self.frames, np.int32),
             meta=np.array([self.proc_w, self.proc_h, self.scale], np.float64),
             stats=np.array([repr(self.stats)]),
@@ -76,26 +78,36 @@ class TrackSet:
 
     @classmethod
     def load(cls, path: str) -> "TrackSet":
-        z = np.load(path, allow_pickle=False)
+        # NpzFile decompresses an array on *every* item access, so read each array exactly once
+        # (indexing z["frames"] inside the per-track loop made loading O(tracks x file size)).
+        with np.load(path, allow_pickle=False) as z:
+            a = {k: z[k] for k in z.files}
+        lens, ids, frames, xy = a["lens"], a["ids"], a["frames"], a["xy"]
+        colors, dyn, reacq = a["colors"], a["dynamic"], a["reacq"]
+        link = a.get("link")
+        offs = np.concatenate([[0], np.cumsum(lens)])
         tracks = []
-        o = 0
-        for i, n in enumerate(z["lens"]):
-            t = Track(id=int(z["ids"][i]))
-            t.frames = z["frames"][o:o + n].tolist()
-            t.xy = z["xy"][o:o + n].tolist()
-            t.color = tuple(int(c) for c in z["colors"][i])
-            t.dynamic = bool(z["dynamic"][i])
-            t.reacquired = int(z["reacq"][i])
+        for i in range(len(lens)):
+            o, e = offs[i], offs[i + 1]
+            t = Track(id=int(ids[i]))
+            t.frames = frames[o:e].tolist()
+            t.xy = [tuple(p) for p in xy[o:e].tolist()]
+            t.color = tuple(int(c) for c in colors[i])
+            t.dynamic = bool(dyn[i])
+            t.reacquired = int(reacq[i])
+            if link is not None and bool(link[i]):
+                t.kind = "link"
             tracks.append(t)
-            o += n
-        pw, ph, s = z["meta"]
+        pw, ph, s = a["meta"]
         import ast
-        stats = ast.literal_eval(str(z["stats"][0]))
-        return cls(tracks, z["seq_frames"].tolist(), int(pw), int(ph), float(s), stats)
+        stats = ast.literal_eval(str(a["stats"][0]))
+        return cls(tracks, a["seq_frames"].tolist(), int(pw), int(ph), float(s), stats)
 
     def usable(self, min_len: int, exclude: Optional[set] = None) -> list[Track]:
         exclude = exclude or set()
-        return [t for t in self.tracks if not t.dynamic and len(t.frames) >= min_len and t.id not in exclude]
+        # link tracks only exist on link frames (~3/s), so they are judged by observation count
+        return [t for t in self.tracks if not t.dynamic and t.id not in exclude and
+                (len(t.frames) >= 3 if t.kind == "link" else len(t.frames) >= min_len)]
 
 
 class FeatureTracker:
@@ -121,7 +133,12 @@ class FeatureTracker:
         self.reacq_window = 40
         self.max_points = settings.max_points
         self.anchor_max_age = 30
-        self.anchor_tol = 1.0 * max(0.75, res)
+        self.anchor_policy = "end"
+        self.anchor_noise_factor = 3.0
+        self._strength_hist: list[float] = []
+        # tight appearance check: a track whose position no longer matches its reference template to within
+        # ~0.4 px has started to slide; it is ended (anchor_policy) rather than allowed to drift
+        self.anchor_tol = 0.4 * max(0.75, res)
 
     # ------------------------------------------------------------------
     def _descriptors(self, gray: np.ndarray, pts: np.ndarray):
@@ -143,7 +160,7 @@ class FeatureTracker:
     def _hamming(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         return np.unpackbits(np.bitwise_xor(a, b), axis=-1).sum(-1)
 
-    def run(self, video_path: str, start: int, end: int, step: int, scale: float, report) -> TrackSet:
+    def run(self, video_path: str, start: int, end: int, step: int, scale: float, report, linker=None) -> TrackSet:
         tracks: list[Track] = []
         active: list[Track] = []           # tracks alive in previous frame
         lost: list[Track] = []             # candidates for re-acquisition
@@ -164,6 +181,8 @@ class FeatureTracker:
                 frame = cv2.resize(frame, (self.w, self.h), interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             seq_frames.append(n)
+            if linker is not None:
+                linker.maybe_add(k, n, gray, frame, force=(n + step > end))
 
             # ---- 1+2: optical flow with forward-backward check ----
             if prev_gray is not None and active:
@@ -191,7 +210,12 @@ class FeatureTracker:
                 active = survivors
 
                 # ---- 2b: drift removal - refine against each track's anchor appearance ----
-                self._anchor_refine(active, anchors, gray, k, stats)
+                drop = self._anchor_refine(active, anchors, gray, k, stats)
+                if drop:
+                    for i in drop:
+                        active[i].end_reason = "anchor"
+                    stats["anchor_ended"] = stats.get("anchor_ended", 0) + len(drop)
+                    active = [t for i, t in enumerate(active) if i not in drop]
 
                 # ---- 3: epipolar verification against an earlier frame ----
                 gap_frame = seq_frames[max(0, len(seq_frames) - 1 - 5)]
@@ -280,6 +304,8 @@ class FeatureTracker:
                                                   useHarrisDetector=False)
                 if corners is not None and len(corners):
                     corners = corners.reshape(-1, 2)
+                    corners = self._strength_filter(gray, corners, stats)
+                if corners is not None and len(corners):
                     cv2.cornerSubPix(gray, corners.reshape(-1, 1, 2), (5, 5), (-1, -1),
                                      (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
                     desc, valid = self._descriptors(gray, corners)
@@ -328,15 +354,34 @@ class FeatureTracker:
         stats["frames"] = len(seq_frames)
         return TrackSet(tracks, seq_frames, self.w, self.h, scale, stats)
 
+    def _strength_filter(self, gray, corners, stats):
+        """Absolute corner-strength floor. goodFeaturesToTrack's threshold is relative to the
+        strongest corner *in the same frame*, so a blurred / dark frame (whip pan, covered lens)
+        happily yields thousands of noise 'corners' that die immediately. Compare against the
+        typical strength in recent good frames instead."""
+        eig = cv2.cornerMinEigenVal(gray, 7, 3)
+        ij = np.clip(np.round(corners).astype(int), 0, [self.w - 1, self.h - 1])
+        strength = eig[ij[:, 1], ij[:, 0]]
+        self._strength_hist.append(float(np.percentile(strength, 90)))
+        if len(self._strength_hist) > 200:
+            self._strength_hist.pop(0)
+        ref = float(np.percentile(self._strength_hist, 75))
+        keep = strength >= 0.12 * ref
+        if (~keep).any():
+            stats["weak_corners_rejected"] = stats.get("weak_corners_rejected", 0) + int((~keep).sum())
+        return corners[keep]
+
     def _anchor_refine(self, active, anchors, gray, k, stats):
         """Re-align each track against its anchor frame (template) to cancel the
         drift that chained frame-to-frame optical flow accumulates."""
         groups: dict[int, list[int]] = {}
+        drop: set[int] = set()
         for i, t in enumerate(active):
             if 0 <= t.anchor_k < k and t.anchor_k in anchors:
                 groups.setdefault(t.anchor_k, []).append(i)
             elif t.anchor_k != k:
                 t.anchor_k, t.anchor_xy = k, t.xy[-1]
+        results = []
         for ak, idxs in groups.items():
             a_pts = np.array([active[i].anchor_xy for i in idxs], np.float32).reshape(-1, 1, 2)
             guess = np.array([active[i].xy[-1] for i in idxs], np.float32).reshape(-1, 1, 2)
@@ -344,18 +389,31 @@ class FeatureTracker:
                                                     winSize=self.lk["winSize"], maxLevel=2,
                                                     criteria=self.lk["criteria"], flags=cv2.OPTFLOW_USE_INITIAL_FLOW)
             d = np.linalg.norm((ref - guess).reshape(-1, 2), axis=1)
-            ref = ref.reshape(-1, 2)
+            results.append((ak, idxs, ref.reshape(-1, 2), st.ravel(), d))
+        # Tolerance adapts to this frame's localisation noise: on clean texture tracks agree with their
+        # template to ~0.1 px and anything past 0.4 px is sliding; on faint, noisy texture the typical
+        # disagreement is larger, and ending every track that exceeds a fixed 0.4 px would leave too few
+        # long tracks. Use max(base, 3 x median disagreement).
+        all_d = np.concatenate([r[4][r[3] == 1] for r in results]) if results else np.zeros(0)
+        tol = max(self.anchor_tol, self.anchor_noise_factor * float(np.median(all_d))) if len(all_d) >= 20 else self.anchor_tol
+        for ak, idxs, ref, st, d in results:
             for j, i in enumerate(idxs):
                 t = active[i]
-                if st[j, 0] == 1 and d[j] < self.anchor_tol:
+                if st[j] == 1 and d[j] < tol:
                     t.xy[-1] = (float(ref[j, 0]), float(ref[j, 1]))
                     stats["anchor_refined"] = stats.get("anchor_refined", 0) + 1
                     if k - ak >= self.anchor_max_age:
                         t.anchor_k, t.anchor_xy = k, t.xy[-1]
                 else:
-                    # appearance changed too much: start a new anchor here
-                    t.anchor_k, t.anchor_xy = k, t.xy[-1]
                     stats["anchor_reset"] = stats.get("anchor_reset", 0) + 1
+                    if self.anchor_policy == "end":
+                        # the feature no longer matches its reference appearance: frame-to-frame flow has
+                        # slid off it. End the track (a fresh one will be detected) instead of re-anchoring,
+                        # which would lock the accumulated drift into the template.
+                        drop.add(i)
+                    else:
+                        t.anchor_k, t.anchor_xy = k, t.xy[-1]
+        return drop
 
     def _reacquire(self, corners, desc, valid, lost, active, history, n):
         """Match new detections to recently lost tracks. Returns {corner_index: Track}."""
@@ -407,6 +465,36 @@ def run_tracking(video_path: str, info, settings: AnalysisSettings, report) -> T
         report.log(f"Auto frame sampling: tracking every {step} frame(s) "
                    f"({(end - start) // step + 1} of {end - start + 1} frames; {info.fps / step:.1f} fps effective)")
     tr = FeatureTracker(settings, pw, ph)
-    ts = tr.run(video_path, start, end, step, scale, report)
+    from .linking import LinkFeatureCollector, build_link_tracks, connectivity_gaps
+    eff_fps = max(1.0, info.fps / step)
+    linker = LinkFeatureCollector(every=max(1, int(round(eff_fps / 3))), proc_w=pw, proc_h=ph)
+    ts = tr.run(video_path, start, end, step, scale, report, linker=linker)
     ts.stats["frame_step"] = step
+    # ---- wide-baseline linking (bridges dead zones, limits drift on long clips) ----
+    if hasattr(report, "log"):
+        report.log(f"Collected {len(linker.frames)} wide-baseline link frames (SIFT)")
+    window = int(round(4.0 * eff_fps))
+    gaps = connectivity_gaps(ts.frames, ts.tracks)
+    link_tracks, lstats = [], {"link_tracks": 0, "verified_matches": 0, "pairs_linked": 0, "pairs_tested": 0}
+    link_seq = []
+    if gaps:
+        # Link tracks are only used to bridge places where optical-flow tracking actually broke; clips that
+        # track continuously are solved exactly as before (wide-baseline matches carry more outliers).
+        res = max(pw, ph) / 1280.0
+        link_tracks, lstats = build_link_tracks(linker, window, 1.5 * max(0.75, res), report, ratio=0.75, mode="star")
+        span = lambda t: any(min(t.frames) <= a and max(t.frames) >= b for a, b in gaps)
+        link_tracks = [t for t in link_tracks if span(t)]
+        lstats["link_tracks"] = len(link_tracks)
+        fpos = {n: i for i, n in enumerate(ts.frames)}
+        near = lambda n: any(fpos.get(a, 0) - window <= fpos[n] <= fpos.get(b, 0) + window for a, b in gaps)
+        link_seq = [k for k, n in zip(linker.seq_idx, linker.frames) if near(n)]
+    ts.tracks.extend(link_tracks)
+    ts.stats.update({f"link_{k}" if not k.startswith("link") else k: v for k, v in lstats.items()})
+    ts.stats["link_seq_idx"] = link_seq
+    ts.stats["dead_zones"] = gaps
+    if hasattr(report, "log") and gaps:
+        report.log(f"Link tracks bridging tracking breaks: {lstats['link_tracks']} "
+                   f"(from {lstats['verified_matches']} verified matches, {lstats['pairs_linked']}/{lstats['pairs_tested']} frame pairs)")
+        for a, b in gaps:
+            report.log(f"Optical-flow tracking broke between frames {a} and {b}; bridging with link tracks")
     return ts

@@ -118,6 +118,28 @@ def evaluate(sol, gt):
         rerr.append(np.degrees(np.arccos(np.clip((np.trace(d) - 1) / 2, -1, 1))))
     out["rot_error_deg_mean"] = float(np.mean(rerr))
     out["rot_error_deg_max"] = float(np.max(rerr))
+    rerr = np.asarray(rerr)
+    dz = gt.get("dead_zone")
+    if dz:
+        fr = np.asarray(frames)
+        for name, m in (("before", fr < dz[0]), ("dead_zone", (fr >= dz[0]) & (fr < dz[1])), ("after", fr >= dz[1])):
+            if m.any():
+                out[f"pos_error_{name}_pct"] = float(100 * pos_err[m].mean() / max(path, 1e-9))
+                out[f"rot_error_{name}_deg"] = float(rerr[m].mean())
+    out["solved_after_dead_zone"] = None
+    if dz:
+        st = np.asarray(sol.frame_status)
+        out["solved_after_dead_zone"] = f"{int((st[np.asarray(frames) >= dz[1]] != 'interpolated').sum())}/{int((np.asarray(frames) >= dz[1]).sum())}"
+    # floor: automatically detected ground plane vs. the true floor (world z = 0 plane)
+    from camtrack.scene.scene import estimate_auto_ground
+    g = estimate_auto_ground(sol)
+    if g is not None:
+        n_gt = R @ np.asarray(g["normal"])
+        out["auto_floor_normal_error_deg"] = float(np.degrees(np.arccos(min(1.0, abs(n_gt[2]) / np.linalg.norm(n_gt)))))
+        p_gt = s * R @ np.asarray(g["point"]) + t
+        out["auto_floor_height_error_m"] = float(abs(p_gt[2]))
+    else:
+        out["auto_floor_normal_error_deg"] = None
     return out
 
 
@@ -163,6 +185,9 @@ def run(footage_dir, name, settings=None, verbose=False):
     sol = solve(ts, s, rep)
     t2 = time.time()
     ev = evaluate(sol, gt)
+    if os.environ.get("CAMTRACK_SAVE_SOLUTIONS"):  # optional: keep solves for offline inspection
+        from camtrack.solver.io import save_solution
+        save_solution(sol, os.path.join(os.environ["CAMTRACK_SAVE_SOLUTIONS"], f"sol_{name}.npz"))
     if name == "outdoor":
         ev.update(moving_object_check(sol, gt))
     res = dict(scenario=name, description=gt["description"], mode=sol.mode,
@@ -181,7 +206,7 @@ if __name__ == "__main__":
         out_json = sys.argv[sys.argv.index("--json") + 1]
         args = [a for a in args if a != out_json]
     footage = args[0]
-    names = args[1:] or ["forward", "sideways", "orbit", "flat", "outdoor", "indoor", "lowtexture", "tripod", "zoom"]
+    names = args[1:] or ["forward", "sideways", "orbit", "flat", "outdoor", "indoor", "lowtexture", "tripod", "zoom", "longwalk", "longwalk_nogap"]
     results = []
     for n in names:
         print(f"=== {n}", flush=True)

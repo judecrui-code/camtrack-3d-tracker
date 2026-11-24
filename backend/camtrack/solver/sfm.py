@@ -75,6 +75,40 @@ class Solution:
         return ok
 
 
+def _robust_similarity(src, dst, rng, iters=300):
+    """RANSAC + Umeyama similarity dst = s R src + t. Returns (s, R, t, n_inliers) or None."""
+    n = len(src)
+    if n < 4:
+        return None
+    def fit(a, b):
+        ma, mb = a.mean(0), b.mean(0)
+        xa, xb = a - ma, b - mb
+        U, D, Vt = np.linalg.svd(xb.T @ xa / len(a))
+        S = np.eye(3)
+        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+            S[2, 2] = -1
+        R = U @ S @ Vt
+        var = (xa ** 2).sum() / len(a)
+        s = np.trace(np.diag(D) @ S) / max(var, 1e-12)
+        return s, R, mb - s * R @ ma
+    ext = np.median(np.linalg.norm(dst - np.median(dst, 0), axis=1))
+    thr = 0.03 * max(ext, 1e-9)
+    best, best_in = None, None
+    for _ in range(iters):
+        idx = rng.choice(n, 4, replace=False)
+        s, R, t = fit(src[idx], dst[idx])
+        if not np.isfinite(s) or s <= 0:
+            continue
+        err = np.linalg.norm(s * src @ R.T + t - dst, axis=1)
+        inl = err < thr
+        if best_in is None or inl.sum() > best_in.sum():
+            best, best_in = (s, R, t), inl
+    if best_in is None or best_in.sum() < max(6, 0.3 * n):
+        return None
+    s, R, t = fit(src[best_in], dst[best_in])
+    return s, R, t, int(best_in.sum())
+
+
 class SequentialSfM:
     def __init__(self, ts: TrackSet, settings: AnalysisSettings, report, exclude_ids: Optional[set] = None):
         self.s = settings
@@ -106,6 +140,9 @@ class SequentialSfM:
         order_t = np.argsort(self.obs_t, kind="stable")
         self.track_obs = np.split(order_t, np.searchsorted(self.obs_t[order_t], np.arange(1, self.T)))
         self.frame_map = [dict(zip(self.obs_t[ix].tolist(), ix.tolist())) for ix in self.frame_obs]
+        # link tracks (wide-baseline matches) may be the only thing tying the two sides of a tracking
+        # dead zone together, so bundle adjustment must always include them
+        self.is_link = np.array([getattr(t, "kind", "klt") == "link" for t in self.tracks], bool)
         self.thresh = settings.reprojection_threshold
         self.min_angle = settings.min_triangulation_angle
         self.rng = np.random.default_rng(12345)
@@ -163,7 +200,9 @@ class SequentialSfM:
                 kfs.append(i)
         if kfs[-1] != self.N - 1:
             kfs.append(self.N - 1)
-        return kfs
+        # link frames carry the wide-baseline SIFT tracks that bridge dead zones: always keyframes
+        links = [i for i in self.ts.stats.get("link_seq_idx", []) if 0 <= i < self.N]
+        return sorted(set(kfs) | set(links))
 
     # -------------------------------------------------------- two view init
     def _triangulate_pair(self, xa, xb, R, t):
@@ -318,14 +357,18 @@ class SequentialSfM:
             self.cam_focal[fi] = self.cam_focal[nearest]
         K = self._K(fi)
         r0, t0 = self.rv[nearest].copy().reshape(3, 1), self.tv[nearest].copy().reshape(3, 1)
-        ok, rvec, tvec, inl = cv2.solvePnPRansac(obj, img, K, self._dist(), iterationsCount=2000,
+        # Frames bridged across a tracking dead zone see mostly wide-baseline link points, of which only
+        # ~25% may be right (repetitive texture). RANSAC copes if it runs long enough and the inlier-ratio
+        # gate is not stricter than the data: require >= 15% (and >= 10 points), not 25%.
+        min_inl = max(10, 0.15 * len(ix))
+        ok, rvec, tvec, inl = cv2.solvePnPRansac(obj, img, K, self._dist(), iterationsCount=2000 if len(ix) > 300 else 6000,
                                                  reprojectionError=max(2.0, 2 * self.thresh), confidence=0.9999,
                                                  flags=cv2.SOLVEPNP_SQPNP)
-        if not ok or inl is None or len(inl) < max(8, 0.25 * len(ix)):
+        if not ok or inl is None or len(inl) < min_inl:
             # fall back to iterative with neighbour's pose as initial guess
             ok, rvec, tvec, inl = cv2.solvePnPRansac(obj, img, K, self._dist(), r0, t0, True, 1000,
                                                      max(2.0, 2 * self.thresh), 0.999, flags=cv2.SOLVEPNP_ITERATIVE)
-            if not ok or inl is None or len(inl) < max(8, 0.25 * len(ix)):
+            if not ok or inl is None or len(inl) < min_inl:
                 return False
         inl = inl.ravel()
         rvec, tvec = cv2.solvePnPRefineLM(obj[inl], img[inl], K, self._dist(), rvec, tvec)
@@ -502,6 +545,7 @@ class SequentialSfM:
                 pick = tr[order][first]
                 pick = pick[~sel[pick]]
                 sel[pick] = True
+        sel |= self.is_link & (cnt >= 2)
         return sel
 
     def filter_outliers(self, factor=1.0):
@@ -541,13 +585,25 @@ class SequentialSfM:
             self.cam_focal = np.full(self.N, self.f)
         self.run_ba(opt_f=False, max_nfev=20)
         self.filter_outliers()
+        # Best-next-frame registration (as in COLMAP): always add the unregistered keyframe that
+        # currently sees the most reconstructed 3D points, triangulate, repeat. Unlike a fixed outward
+        # order, one hard frame cannot strand everything behind it. A failed frame is retried only once
+        # it sees clearly more 3D points than at its failed attempt.
         done = 0
-        failed = []
-        for fi in order:
+        pending = set(order)
+        tried_at: dict[int, int] = {}
+        while pending:
             self._check()
+            use = self.inlier & self.has_pt[self.obs_t]
+            cnt = np.bincount(self.obs_f[use], minlength=self.N)
+            cand = [fi for fi in pending if cnt[fi] >= 10 and cnt[fi] > 1.2 * tried_at.get(fi, -10) + 2]
+            if not cand:
+                break
+            fi = max(cand, key=lambda x: (cnt[x], -abs(x - a)))
             if not self.register(fi):
-                failed.append(fi)
+                tried_at[fi] = int(cnt[fi])
                 continue
+            pending.discard(fi)
             self.triangulate_tracks(self.tracks_in_frame(fi))
             done += 1
             if done % 5 == 0 or done <= 2:
@@ -555,12 +611,6 @@ class SequentialSfM:
                 self.filter_outliers()
             if window is None and hasattr(self.report, "__call__"):
                 self.report(0.15 + 0.45 * done / max(1, len(order)), f"Registered keyframe {self.frames[fi]} ({done}/{len(order)})")
-        for fi in failed:  # second chance once more structure exists
-            if self.register(fi):
-                self.triangulate_tracks(self.tracks_in_frame(fi))
-        for fi in kfs:
-            if self.reg[fi] or fi not in targets:
-                continue
         self.run_ba(opt_f=opt_focal and not var, var_focal=var, max_nfev=40)
         self.filter_outliers()
         r = self.run_ba(opt_f=opt_focal and not var, var_focal=var, max_nfev=30)
@@ -652,16 +702,224 @@ class SequentialSfM:
         self._reset(f_start, *self._fixed_dist())
         hyps, _ = self.two_view(best["a"], best["b"], use_h=use_h)
         hyp = min(hyps, key=lambda h: 0 if h["kind"] == best["hyp"]["kind"] and np.allclose(h["R"], best["hyp"]["R"], atol=1e-3) else 1) if hyps else best["hyp"]
-        nreg, ntar, rmse = self.incremental(kfs, best["a"], best["b"], hyp, f_start, window=None, opt_focal=estimate_f)
+        # Focal stays fixed at the hypothesis-search result while the reconstruction grows: refining it on a
+        # partial, weakly-conditioned reconstruction (e.g. walking forward) lets it drift and breaks the chain
+        # on long clips. It is refined once all frames are in (final_refinement), where the whole clip
+        # constrains it. Zoom shots (variable focal) still estimate per-frame focal incrementally.
+        nreg, ntar, rmse = self.incremental(kfs, best["a"], best["b"], hyp, f_start, window=None,
+                                            opt_focal=estimate_f and self.s.variable_focal)
         self.log(f"Keyframes registered {nreg}/{ntar}, rmse {rmse:.3f}px, f={self.f:.1f}px")
         self.keyframes = kfs
 
         # ---- all frames ----
         rep.stage("Registering all frames", 0.6, 0.75) if hasattr(rep, "stage") else None
         self.register_remaining(kfs)
+        self.recover_segments(kfs)
         rep.stage("Global bundle adjustment", 0.75, 0.97) if hasattr(rep, "stage") else None
         self.final_refinement(estimate_f)
         return self.build_solution(mode, kfs, estimate_f)
+
+    # ------------------------------------------------------------ segments
+    def _snapshot(self):
+        return dict(rv=self.rv.copy(), tv=self.tv.copy(), reg=self.reg.copy(), pt=self.pt.copy(),
+                    has_pt=self.has_pt.copy(), inlier=self.inlier.copy(), f=self.f, k1=self.k1, k2=self.k2,
+                    cam_focal=None if self.cam_focal is None else self.cam_focal.copy(),
+                    ref_frame=getattr(self, "ref_frame", 0))
+
+    def _restore(self, sn):
+        for k, v in sn.items():
+            setattr(self, k, v)
+
+    def recover_segments(self, kfs):
+        """Re-initialise on long runs of frames that could not be chained to the main solve
+        (e.g. the camera saw entirely new scenery after a dead zone), reconstruct them
+        independently, then join them to the main reconstruction:
+          * by a robust similarity on 3D points both reconstructions share (measured), or
+          * if they share nothing, by motion continuity across the gap (estimated, flagged)."""
+        self.segments = []
+        min_run = max(12, self.N // 40)
+        for _ in range(4):  # a few independent segments at most
+            unreg = ~self.reg
+            runs, i = [], 0
+            while i < self.N:
+                if unreg[i]:
+                    j = i
+                    while j + 1 < self.N and unreg[j + 1]:
+                        j += 1
+                    runs.append((i, j))
+                    i = j + 1
+                else:
+                    i += 1
+            # only runs that actually contain trackable frames
+            cand = []
+            for r0, r1 in runs:
+                trackable = [fi for fi in range(r0, r1 + 1) if len(self.frame_obs[fi]) >= 40]
+                if len(trackable) >= min_run:
+                    cand.append((len(trackable), r0, r1))
+            if not cand:
+                return
+            _, r0, r1 = max(cand)
+            # restrict to the trackable part of the run (drop the dead frames at its edges)
+            idx = [fi for fi in range(r0, r1 + 1) if len(self.frame_obs[fi]) >= 40]
+            r0, r1 = idx[0], idx[-1]
+            if not self._reconstruct_segment(kfs, r0, r1):
+                # mark as tried so we do not loop on it
+                self.segments.append(dict(frames=(self.frames[r0], self.frames[r1]), mode="failed"))
+                return
+
+    def _reconstruct_segment(self, kfs, r0, r1) -> bool:
+        main = self._snapshot()
+        seg_kfs = [k for k in kfs if r0 <= k <= r1]
+        if len(seg_kfs) < 4:
+            seg_kfs = sorted(set(seg_kfs) | set(range(r0, r1 + 1, max(1, (r1 - r0) // 12))))
+        self.log(f"Frames {self.frames[r0]}-{self.frames[r1]} could not be chained to the main solve; "
+                 f"reconstructing them as a separate segment")
+        pairs = self.find_init_pairs(seg_kfs, use_h=False, top=2)
+        best = None
+        for (_, a, b, _, _) in pairs:
+            self._restore(main)
+            self.inlier = main["inlier"].copy()
+            hyps, _ = self.two_view(a, b, use_h=True)
+            for hyp in sorted(hyps, key=lambda h: -h["n"])[:3]:
+                try:
+                    nreg, ntar, rmse = self.incremental(seg_kfs, a, b, hyp, main["f"], window=None, opt_focal=False)
+                except np.linalg.LinAlgError:
+                    continue
+                if nreg >= max(3, 0.6 * ntar) and rmse < 2 * self.thresh and (best is None or nreg > best[0]):
+                    for fi in range(r0, r1 + 1):
+                        if not self.reg[fi] and self.register(fi):
+                            self.triangulate_tracks(self.tracks_in_frame(fi))
+                    best = (nreg, self._snapshot())
+            if best is not None:
+                break
+        self._restore(main)
+        if best is None:
+            self.log("  segment could not be initialised")
+            return False
+        seg = best[1]
+        frames_seg = np.where(seg["reg"] & (np.arange(self.N) >= r0) & (np.arange(self.N) <= r1))[0]
+        common = np.where(main["has_pt"] & seg["has_pt"])[0]
+        sim = None
+        if len(common) >= 8:
+            sim = _robust_similarity(seg["pt"][common], main["pt"][common], self.rng)
+        pj = None if sim is not None else self._pose_join(seg, main, frames_seg)
+        if sim is not None:
+            s_, R, t, n_in = sim
+            mode = "measured"
+            self.log(f"  joined to the main solve through {n_in} shared 3D points")
+        elif pj is not None:
+            s_, R, t, n_fr = pj
+            mode = "measured-frames"
+            self.log(f"  joined to the main solve by locating {n_fr} frame(s) against the other side's 3D points")
+        else:
+            s_, R, t = self._continuity_alignment(seg, frames_seg, r0, r1)
+            mode = "estimated"
+            self.log("  no shared 3D points: joined by motion continuity (estimated, not measured)")
+        # write the transformed segment into the main reconstruction
+        for fi in frames_seg:
+            Rs = cv2.Rodrigues(seg["rv"][fi])[0]
+            Rn = Rs @ R.T
+            self.rv[fi] = cv2.Rodrigues(Rn)[0].ravel()
+            self.tv[fi] = -Rn @ t + s_ * seg["tv"][fi]
+            self.reg[fi] = True
+        new_pts = np.where(seg["has_pt"] & ~self.has_pt)[0]
+        self.pt[new_pts] = s_ * seg["pt"][new_pts] @ R.T + t
+        self.has_pt[new_pts] = True
+        seg_obs = np.isin(self.obs_f, frames_seg)
+        self.inlier[seg_obs] = seg["inlier"][seg_obs]
+        self.segments.append(dict(frames=(self.frames[r0], self.frames[r1]), mode=mode,
+                                  shared_points=int(len(common)), shared_frames=int(pj[3]) if pj is not None else 0,
+                                  registered=int(len(frames_seg))))
+        return True
+
+    def _pose_join(self, seg, main, frames_seg):
+        """Join through shared *observations*: frames of either reconstruction that see enough of the
+        other reconstruction's 3D points are located in it by PnP, giving camera poses in both coordinate
+        systems; the similarity between them is solved from those poses."""
+        K, dist = self._K(), self._dist()
+        pairs = []  # (R_a, c_a, R_b, c_b): pose in segment coords, pose in main coords
+
+        def locate(fi, pt, has, inl):
+            ix = self.frame_obs[fi]
+            ix = ix[inl[ix] & has[self.obs_t[ix]]]
+            if len(ix) < 12:
+                return None
+            try:
+                ok, rv, tv, iv = cv2.solvePnPRansac(pt[self.obs_t[ix]].astype(np.float64), self.obs_xy[ix].astype(np.float64),
+                                                    K, dist, iterationsCount=1000, reprojectionError=max(2.0, 2 * self.thresh),
+                                                    confidence=0.999, flags=cv2.SOLVEPNP_SQPNP)
+            except cv2.error:
+                return None
+            if not ok or iv is None or len(iv) < 10:
+                return None
+            R = cv2.Rodrigues(rv)[0]
+            return R, -R.T @ tv.ravel()
+
+        # segment frames located against main's points
+        for fi in frames_seg:
+            m = locate(fi, main["pt"], main["has_pt"], main["inlier"])
+            if m is not None:
+                Rs = cv2.Rodrigues(seg["rv"][fi])[0]
+                pairs.append((Rs, pose_center(seg["rv"][fi], seg["tv"][fi]), m[0], m[1]))
+        # main frames located against the segment's points
+        for fi in np.where(main["reg"])[0]:
+            m = locate(fi, seg["pt"], seg["has_pt"], seg["inlier"])
+            if m is not None:
+                Rm = cv2.Rodrigues(main["rv"][fi])[0]
+                pairs.append((m[0], m[1], Rm, pose_center(main["rv"][fi], main["tv"][fi])))
+        if not pairs:
+            return None
+        # rotation: R_main_cam = R_seg_cam @ R^T  =>  R = R_main_cam^T R_seg_cam (chordal mean)
+        acc = sum(Rb.T @ Ra for Ra, ca, Rb, cb in pairs)
+        U, _, Vt = np.linalg.svd(acc)
+        R = U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+        ca = np.array([p[1] for p in pairs])
+        cb = np.array([p[3] for p in pairs])
+        if len(pairs) >= 2 and np.linalg.norm(ca - ca.mean(0), axis=1).max() > 1e-6:
+            rc = ca @ R.T
+            s_ = float(np.sum((rc - rc.mean(0)) * (cb - cb.mean(0))) / max(np.sum((rc - rc.mean(0)) ** 2), 1e-12))
+            if s_ <= 0:
+                return None
+        else:
+            return None
+        t = cb.mean(0) - s_ * (ca @ R.T).mean(0)
+        return s_, R, t, len(pairs)
+
+    def _continuity_alignment(self, seg, frames_seg, r0, r1):
+        """Similarity placing the segment so the camera path is continuous across the gap."""
+        main_reg = np.where(self.reg)[0]
+        before = main_reg[main_reg < r0]
+        after = main_reg[main_reg > r1]
+        first, last = frames_seg[0], frames_seg[-1]
+        if len(before):
+            anchor, seg_f, gap = before[-1], first, first - before[-1]
+            prev = before[-min(len(before), 6)]
+        else:
+            anchor, seg_f, gap = after[0], last, last - after[0]
+            prev = after[min(len(after) - 1, 5)]
+        Rm = cv2.Rodrigues(self.rv[anchor])[0]
+        Rs = cv2.Rodrigues(seg["rv"][seg_f])[0]
+        R = Rm.T @ Rs  # camera orientation continuous across the gap
+        cm, cp = pose_center(self.rv[anchor], self.tv[anchor]), pose_center(self.rv[prev], self.tv[prev])
+        vel = (cm - cp) / max(1, abs(anchor - prev))
+        target = cm + vel * gap
+        # scale: match the median depth of points seen at the joining frames
+        def med_depth(rv, tv, pt, has, fi):
+            ix = self.frame_obs[fi]
+            tr = self.obs_t[ix]
+            tr = tr[has[tr]]
+            if len(tr) < 5:
+                return None
+            Rr = cv2.Rodrigues(rv[fi])[0]
+            z = (pt[tr] @ Rr.T + tv[fi])[:, 2]
+            z = z[z > 0]
+            return float(np.median(z)) if len(z) else None
+        dm = med_depth(self.rv, self.tv, self.pt, self.has_pt, anchor)
+        ds = med_depth(seg["rv"], seg["tv"], seg["pt"], seg["has_pt"], seg_f)
+        s_ = dm / ds if dm and ds else 1.0
+        cs = pose_center(seg["rv"][seg_f], seg["tv"][seg_f])
+        t = target - s_ * R @ cs
+        return s_, R, t
 
     def register_remaining(self, kfs):
         kset = set(kfs)
@@ -873,9 +1131,16 @@ class SequentialSfM:
                 w = (i - a) / (b - a)
                 qa = rot_to_quat(cv2.Rodrigues(rv[a])[0])
                 qb = rot_to_quat(cv2.Rodrigues(rv[b])[0])
-                R = quat_to_rot(slerp(qa, qb, w))
+                # smoothstep keeps angular velocity continuous-ish at both ends of the gap
+                R = quat_to_rot(slerp(qa, qb, w * w * (3 - 2 * w)) if b - a > 2 else slerp(qa, qb, w))
                 ca, cb = pose_center(rv[a], tv[a]), pose_center(rv[b], tv[b])
-                c = (1 - w) * ca + w * cb
+                # cubic Hermite on position using the solved velocities either side of the gap
+                a0 = lo[-2] if len(lo) > 1 else a
+                b1 = hi[1] if len(hi) > 1 else b
+                va = (ca - pose_center(rv[a0], tv[a0])) / max(1, a - a0) * (b - a)
+                vb = (pose_center(rv[b1], tv[b1]) - cb) / max(1, b1 - b) * (b - a)
+                h00, h10, h01, h11 = 2*w**3 - 3*w**2 + 1, w**3 - 2*w**2 + w, -2*w**3 + 3*w**2, w**3 - w**2
+                c = h00 * ca + h10 * va + h01 * cb + h11 * vb
             else:
                 a = lo[-1] if len(lo) else hi[0]
                 R = cv2.Rodrigues(rv[a])[0]
@@ -973,8 +1238,33 @@ class SequentialSfM:
                      "check for moving objects, rolling shutter, or try a different solve method.")
         elif st["mean_error_px"] > 0.5:
             w.append(f"Moderate reprojection error ({st['mean_error_px']:.2f}px). Usable but not a tight solve.")
+        for sg in getattr(self, "segments", []):
+            if sg["mode"] == "estimated":
+                w.append(f"Frames {sg['frames'][0]}-{sg['frames'][1]} were solved as a separate segment that shares no "
+                         "features with the rest of the clip; its placement relative to the rest is ESTIMATED from "
+                         "camera-motion continuity, not measured. Expect a jump or scale change there.")
+            elif sg["mode"] == "measured":
+                w.append(f"Frames {sg['frames'][0]}-{sg['frames'][1]} were re-initialised as a separate segment and "
+                         f"joined to the main solve through {sg['shared_points']} shared 3D points.")
+            elif sg["mode"] == "measured-frames":
+                w.append(f"Frames {sg['frames'][0]}-{sg['frames'][1]} were re-initialised as a separate segment and "
+                         f"joined to the main solve through {sg['shared_frames']} frame(s) located in both; the join "
+                         "is measured but weakly constrained, so check that stretch.")
         if st["n_interpolated_frames"] > 0:
-            w.append(f"{st['n_interpolated_frames']} frame(s) could not be solved and were interpolated from neighbours.")
+            ranges, i = [], 0
+            unreg = ~self.reg
+            while i < self.N:
+                if unreg[i]:
+                    j = i
+                    while j + 1 < self.N and unreg[j + 1]:
+                        j += 1
+                    ranges.append(f"{self.frames[i]}" if i == j else f"{self.frames[i]}-{self.frames[j]}")
+                    i = j + 1
+                else:
+                    i += 1
+            shown = ", ".join(ranges[:8]) + (" ..." if len(ranges) > 8 else "")
+            w.append(f"{st['n_interpolated_frames']} frame(s) had nothing trackable and were interpolated "
+                     f"(smooth curve between solved neighbours): frames {shown}.")
         low = int(np.sum(frame_np < 15))
         if low:
             w.append(f"{low} frame(s) have fewer than 15 solved points; the camera there is weakly constrained.")

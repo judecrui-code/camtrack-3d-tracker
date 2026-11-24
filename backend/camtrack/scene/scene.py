@@ -40,47 +40,92 @@ def camera_axes_raw(sol, fi: int):
 
 
 def estimate_auto_ground(sol) -> Optional[dict]:
-    """Find the dominant plane roughly perpendicular to the first camera's up vector."""
+    """Find the floor: the best-supported roughly horizontal plane that the camera stays above.
+
+    "Up" is the average camera up-vector over the whole clip (robust to a tilted first frame).
+    RANSAC only considers planes within 35 degrees of horizontal, so on long clips the walls, which
+    usually hold far more points than the floor, cannot crowd it out. The winner is refined by
+    least squares on its inliers.
+    """
     if sol.mode == "tripod" or len(sol.points) < 30:
         return None
     rel = sol.reliable_mask(2.0)
     pts = sol.points[rel] if rel.sum() >= 30 else sol.points
+    Rs = [cv2.Rodrigues(np.asarray(r, float))[0] for r in sol.rvecs]
+    up = _unit(-np.mean([R[1] for R in Rs], axis=0))
+    centers = np.array([pose_center(r, t) for r, t in zip(sol.rvecs, sol.tvecs)])
     c0, right, down, fwd = camera_axes_raw(sol, 0)
-    up = -down
-    extent = np.median(np.linalg.norm(pts - np.median(pts, 0), axis=1))
-    thresh = 0.02 * extent
+    extent = float(np.median(np.linalg.norm(pts - np.median(pts, 0), axis=1)))
+    thresh = 0.01 * extent
+    cos_max = np.cos(np.radians(35))
     rng = np.random.default_rng(3)
-    best = None
-    remaining = np.ones(len(pts), bool)
-    for _ in range(4):  # peel off the top planes
-        idx = np.where(remaining)[0]
-        if len(idx) < 30:
+    n_pts = len(pts)
+
+    def best_horizontal(mask):
+        idx = np.where(mask)[0]
+        if len(idx) < 15:
+            return 0, None
+        P = pts[idx]
+        best_cnt, best = 0, None
+        for _ in range(2000):
+            p = P[rng.choice(len(P), 3, replace=False)]
+            n = np.cross(p[1] - p[0], p[2] - p[0])
+            ln = np.linalg.norm(n)
+            if ln < 1e-12:
+                continue
+            n /= ln
+            if n @ up < 0:
+                n = -n
+            if n @ up < cos_max:
+                continue
+            inl = np.abs((P - p[0]) @ n) < thresh
+            c = int(inl.sum())
+            if c > best_cnt:
+                # the camera must be above the plane for (nearly) the whole clip
+                if np.mean((centers - p[0]) @ n > 0) < 0.9:
+                    continue
+                best_cnt, best = c, idx[inl]
+        return best_cnt, best
+
+    # Several horizontal surfaces may be visible (floor, box tops, tables, kerbs, car roofs) and the floor
+    # is often the *least* textured of them. Collect the well-supported horizontal planes, then take the
+    # LOWEST one that has substantial support: the floor is the lowest large flat surface under the camera.
+    cands = []
+    remaining = np.ones(n_pts, bool)
+    for _ in range(4):
+        cnt, members = best_horizontal(remaining)
+        if members is None or cnt < max(15, 0.01 * n_pts):
             break
-        res = ransac_plane(pts[idx], thresh, 800, rng)
-        if res is None:
-            break
-        c, n, inl = res
-        if inl.sum() < max(20, 0.08 * len(pts)):
-            break
+        c_, n_, _ = fit_plane(pts[members])
+        if n_ @ up < 0:
+            n_ = -n_
+        height = float(np.median((centers - c_) @ n_))   # camera height above this plane
+        cands.append((cnt, height, members, n_))
+        remaining[members] = False
+    if not cands:
+        return None
+    # Only planes PARALLEL to the dominant horizontal surface compete on height (box tops / tables are
+    # parallel to the floor; a slanted plane spanning distant points is not), then take the lowest one
+    # with substantial support.
+    top_cnt, _, _, top_n = max(cands, key=lambda cd: cd[0])
+    par = [cd for cd in cands if cd[0] >= 0.25 * top_cnt and cd[3] @ top_n > np.cos(np.radians(5))]
+    cnt, height, members, _ = max(par, key=lambda cd: cd[1])
+    inl = np.zeros(n_pts, bool)
+    inl[members] = True
+    for _ in range(2):  # least-squares refinement
+        c, n, rms = fit_plane(pts[inl])
         if n @ up < 0:
             n = -n
-        align = float(n @ up)
-        # plane must lie below the camera
-        below = float((c0 - c) @ n) > 0
-        if align > 0.6 and below:
-            score = inl.sum() * align
-            if best is None or score > best[0]:
-                best = (score, c, n, int(inl.sum()))
-        remaining[idx[inl]] = False
-    if best is None:
-        return None
-    _, c, n, cnt = best
+        inl = np.abs((pts - c) @ n) < max(2.5 * rms, 0.5 * thresh)
+    c, n, rms = fit_plane(pts[inl])
+    if n @ up < 0:
+        n = -n
     # origin: projection of the point cloud centre (seen in frame 0) onto the plane
     vis = pts[((pts - c0) @ fwd) > 0]
     centre = np.median(vis if len(vis) else pts, 0)
     o = centre - ((centre - c) @ n) * n
     return dict(point=o.tolist(), normal=n.tolist(), frame=int(sol.frames[0]), x_hint=right.tolist(),
-                inliers=cnt, source="auto")
+                inliers=int(inl.sum()), source="auto")
 
 
 def world_transform(sol, scene: dict) -> dict:
@@ -170,6 +215,37 @@ def refine_plane_from_points(sol, point_ids, fallback_point, fallback_normal, gr
         rel = sol.reliable_mask(2.0)
         pts = sol.points[rel] if rel.sum() > 20 else sol.points
         extent = float(np.median(np.linalg.norm(pts - np.median(pts, 0), axis=1)))
+        # The clicked points can be nearly collinear (e.g. along the base of a wall or a painted line);
+        # a plane through them can then tilt freely about that line. Find the dominant surface through
+        # the clicked spot with a local RANSAC instead, and grow from that.
+        sv = np.linalg.svd(sol.points[sel] - sol.points[sel].mean(0), compute_uv=False)
+        well_conditioned = len(sv) >= 2 and sv[1] > 0.2 * sv[0]
+        local_r = max(4 * float(np.max(np.linalg.norm(sol.points[sel] - c, axis=1))), 0.15 * extent)
+        loc = pts[np.linalg.norm(pts - c, axis=1) < local_r]
+        tol0 = 0.01 * extent
+        if len(loc) >= 12:
+            rng = np.random.default_rng(7)
+            best_cnt, best_n = -1, None
+            for _ in range(1500):
+                q = loc[rng.choice(len(loc), 3, replace=False)]
+                nn = np.cross(q[1] - q[0], q[2] - q[0])
+                ln = np.linalg.norm(nn)
+                if ln < 1e-12:
+                    continue
+                nn /= ln
+                if abs((c - q[0]) @ nn) > 2 * tol0:      # must pass through the clicked spot
+                    continue
+                if well_conditioned and abs(nn @ n) < np.cos(np.radians(30)):
+                    continue                              # trust a well-conditioned seed's rough orientation
+                cnt = int((np.abs((loc - q[0]) @ nn) < tol0).sum())
+                if cnt > best_cnt:
+                    best_cnt, best_n, best_p = cnt, nn, q[0]
+            if best_n is not None and best_cnt >= 8:
+                inl = np.abs((loc - best_p) @ best_n) < tol0
+                c2, n2, rms2 = fit_plane(loc[inl])
+                if n2 @ fallback_normal < 0:
+                    n2 = -n2
+                c, n, rms, used = c2, n2, rms2, int(inl.sum())
         seed_n = n.copy()
         tol = max(3 * rms, 0.006 * extent)
         radius = max(0.6 * extent, 4 * float(np.max(np.linalg.norm(sol.points[sel] - c, axis=1))))

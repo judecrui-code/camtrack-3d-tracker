@@ -13,6 +13,8 @@ NOTES = {
     "lowtexture": "many short tracks; slower",
     "tripod": "auto-detected rotation-only",
     "zoom": "variable focal {fr0:.0f}-{fr1:.0f}px (true {ft0:.0f}-{ft1:.0f}px)",
+    "longwalk": "20 s walk with 2 s dead zone (frames 300-359 interpolated); floor {fl}",
+    "longwalk_nogap": "20 s walk round a corner, no dead zone; floor {fl}",
 }
 
 
@@ -26,7 +28,8 @@ def main(path):
         note = NOTES.get(d["scenario"], "").format(
             car=d.get("points_on_moving_object", "?"), pts=d["points"], k1=d["k1_solved"], k1t=d["k1_true"],
             fr0=(d.get("focal_solved_range_px") or [0, 0])[0], fr1=(d.get("focal_solved_range_px") or [0, 0])[1],
-            ft0=(d.get("focal_true_range_px") or [0, 0])[0], ft1=(d.get("focal_true_range_px") or [0, 0])[1])
+            ft0=(d.get("focal_true_range_px") or [0, 0])[0], ft1=(d.get("focal_true_range_px") or [0, 0])[1],
+            fl="not found" if d.get("auto_floor_normal_error_deg") is None else f"{d['auto_floor_normal_error_deg']:.2f}° off")
         pos = d.get("pos_error_mean_pct_of_path")
         out.append(
             f"| {d['scenario']} | {d['mode']} | {d['solved_frames']}/{d['frames']} | {d['reproj_mean_px']:.3f} px | "

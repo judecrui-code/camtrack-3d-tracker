@@ -164,8 +164,20 @@ Open it in Blender via **Scripting → Open `build_scene.py` → Run Script**, o
 - Shi-Tomasi corners with sub-pixel refinement, kept spread out by a minimum-distance mask.
 - Pyramidal Lucas-Kanade optical flow with a forward-backward consistency check.
 - **Anchored refinement:** each track is re-aligned to its reference appearance in an anchor frame,
-  which removes the drift that chained frame-to-frame flow accumulates. On synthetic footage this cut
-  119-frame drift from 1.4 px to 0.4 px.
+  which removes the drift that chained frame-to-frame flow accumulates.
+- **Slide detection:** if a track no longer matches its reference appearance, it is ended and a fresh
+  track is detected, rather than re-anchored, which would lock the accumulated drift in. The tolerance
+  adapts to each frame's noise level: about 0.4 px on clean footage, looser on faint, noisy texture.
+  On a long walking clip with a plain floor, this raised the share of tracks within 1 px of truth
+  during a corner turn from 36% to 72–82%.
+- **Corner-strength floor:** blurred or dark frames (whip pans, a covered lens) no longer spawn
+  thousands of noise "corners".
+- **Gap bridging:** about three times a second, the tracker also extracts SIFT features, which can be
+  matched across large viewpoint changes. Where frame-to-frame tracking breaks (a dead zone), link
+  frames within about 4 s on either side are matched directly to each other. Each match is checked
+  against the epipolar geometry and a cycle-consistency test. These link tracks tie the footage after
+  a dead zone to the 3D points before it. They are only used across detected breaks, so footage that
+  tracks continuously is solved exactly as before.
 - **ORB descriptor verification** catches drift and feature swaps.
 - **RANSAC fundamental matrix** (USAC/MAGSAC) checks against a frame 5 frames back. Tracks that are
   repeatedly epipolar outliers are classified as **moving objects**; they are removed, and their image
@@ -186,15 +198,29 @@ Open it in Blender via **Scripting → Open `build_scene.py` → Run Script**, o
   sweep detects poorly constrained focal length, which triggers a warning. A weak MAP prior (60°
   horizontal FOV) only matters when the footage carries no focal information; when the data
   constrains focal (orbit, indoor, tripod), the data wins (≤ 0.6% error in tests).
-- Incremental registration: PnP RANSAC (SQPnP) + LM refinement; multi-view DLT triangulation with
-  angle, cheirality and reprojection gates; periodic global bundle adjustment with outlier rejection.
+- **Best-next-frame registration** (as in COLMAP): the solver always adds the unregistered keyframe that
+  sees the most reconstructed 3D points, so one hard frame cannot strand everything behind it. Pose
+  estimation is PnP RANSAC (SQPnP) with LM refinement. It tolerates a low share of correct matches
+  (15%), so frames bridged across a dead zone, which see mostly wide-baseline matches, still register.
+- Multi-view DLT triangulation with angle, cheirality and reprojection gates, and periodic global
+  bundle adjustment with outlier rejection.
+- **Focal length is held fixed while the reconstruction grows**, then refined once over the whole clip.
+  Re-estimating it on a partial reconstruction let it drift on long walking shots and broke the chain.
+- **Segment recovery:** if a long stretch still cannot be chained, it is reconstructed as a separate
+  segment and joined to the rest. The join uses shared 3D points or frames located in both segments
+  (measured). If they share nothing, the join comes from camera-motion continuity; that is estimated,
+  and the app warns about it.
 - **Bundle adjustment** (`bundle.py`): Levenberg-Marquardt with analytic Jacobians, the Schur
   complement and robust Huber loss (IRLS). It refines poses, points, focal length, k1/k2, and
   per-frame focal length (zoom, with a random-walk smoothness prior). Large problems run on a
   spatially stratified point subset with capped observations per point; the remaining points are then
   refined with cameras fixed.
-- Remaining frames registered, iterative final BA and outlier removal. Unsolvable frames are
-  interpolated (SLERP) and **flagged**.
+- Remaining frames registered, iterative final BA and outlier removal. Frames with nothing trackable
+  are filled with a smooth curve (cubic position, eased rotation) between the solved frames on either
+  side. They are **flagged**, and the warning lists their frame ranges.
+- **Floor detection** searches only planes within 35° of horizontal (relative to the average camera
+  up-direction) that the camera stays above. On long clips the walls, which usually hold far more
+  points, can no longer crowd the floor out.
 - **Tripod mode:** robust rotation estimation (Kabsch + RANSAC on bearing vectors), points as
   directions, rotation + focal + distortion BA.
 
@@ -212,7 +238,8 @@ useful as an independent cross-check.
   - weakly constrained focal length;
   - few points;
   - weakly constrained frames;
-  - interpolated frames;
+  - interpolated frames (with ranges);
+  - segments joined by estimation rather than measurement;
   - large distortion;
   - tripod (no depth).
 
@@ -225,6 +252,11 @@ footage with exact ground truth**. Scenes are textured planar geometry rendered 
 optional radial distortion, sensor noise and blur, encoded to H.264 (CRF 14). There are 9 scenarios:
 forward dolly, sideways truck, orbit around an object, mostly-flat ground, outdoor with an
 independently moving car, indoor room with barrel distortion, low texture, tripod pan, and zoom.
+There are also two **long-clip** tests: a 20 s, 600-frame handheld walk down a street and round a
+corner, with and without a **2-second dead zone** (heavy motion blur and underexposure) where nothing
+can be tracked. They use large non-repeating textures. An earlier version with exactly tiled walls
+made wide-baseline matching ambiguous by construction: a feature and its copy one tile away are
+indistinguishable.
 
 ```bash
 cd backend
@@ -240,19 +272,21 @@ cd backend
 - camera rotation error;
 - for the outdoor clip, how many solved points lie on the moving car.
 
-Results (1280×720, 120 frames each, default settings, Auto mode):
+Results (1280×720, 120 frames each; the two long clips have 600; default settings, Auto mode):
 
 | Scenario | Mode chosen | Solved frames | Mean reproj. error | Focal error | Position error (% of path) | Rotation error | Notes |
 |---|---|---|---|---|---|---|---|
-| forward | typical | 120/120 | 0.438 px | 2.35% | 0.030% | 0.018° | focal weakly observable in a forward dolly (warned); 7764 pts, 19+68s |
-| sideways | typical | 120/120 | 0.259 px | 0.84% | 0.014% | 0.029° | 4433 pts, 21+53s |
-| orbit | typical | 120/120 | 0.496 px | 0.01% | 0.013% | 0.018° | 7500 pts, 62+41s |
-| flat | typical | 120/120 | 0.386 px | 6.96% | 0.645% | 0.010° | planar scene + constant orientation: focal not observable (warned; weak prior); 5678 pts, 14+191s |
-| outdoor | typical | 120/120 | 0.244 px | 0.19% | 0.022% | 0.006° | independently moving car: 4 of 4092 points on it; 4092 pts, 20+49s |
-| indoor | typical | 120/120 | 0.264 px | 0.64% | 0.042% | 0.032° | barrel distortion recovered: k1 -0.0781 (true -0.08); 5018 pts, 13+50s |
-| lowtexture | typical | 120/120 | 0.783 px | 1.41% | 0.107% | 0.021° | many short tracks; slower; 9986 pts, 190+47s |
-| tripod | tripod | 120/120 | 0.223 px | 0.01% | n/a (no translation) | 0.003° | auto-detected rotation-only; 6105 pts, 14+41s |
-| zoom | typical | 120/120 | 0.332 px | 7.20% | 0.123% | 0.201° | variable focal 967-1501px (true 900-1400px); 5303 pts, 11+44s |
+| forward | typical | 120/120 | 0.279 px | 0.89% | 0.010% | 0.010° | focal weakly observable in a forward dolly (warned); 9151 pts, 18+55s |
+| sideways | typical | 120/120 | 0.187 px | 0.03% | 0.006% | 0.003° | 5713 pts, 17+45s |
+| orbit | typical | 120/120 | 0.323 px | 0.06% | 0.015% | 0.025° | 7980 pts, 36+50s |
+| flat | typical | 120/120 | 0.333 px | 5.40% | 0.494% | 0.011° | planar scene + constant orientation: focal not observable (warned; weak prior); 6914 pts, 13+201s |
+| outdoor | typical | 120/120 | 0.164 px | 0.11% | 0.029% | 0.003° | independently moving car: 33 of 4653 points on it; 4653 pts, 24+60s |
+| indoor | typical | 120/120 | 0.227 px | 0.38% | 0.026% | 0.021° | barrel distortion recovered: k1 -0.0781 (true -0.08); 5686 pts, 14+73s |
+| lowtexture | typical | 120/120 | 0.517 px | 1.16% | 0.352% | 0.110° | many short tracks; slower; 1486 pts, 191+55s |
+| tripod | tripod | 120/120 | 0.197 px | 0.07% | n/a (no translation) | 0.015° | auto-detected rotation-only; 6300 pts, 15+44s |
+| zoom | typical | 120/120 | 0.262 px | 3.29% | 0.036% | 0.104° | variable focal 930-1446px (true 900-1400px); 6668 pts, 14+62s |
+| longwalk | typical | 540/600 | 0.357 px | 0.08% | 0.164% | 0.525° | 20 s walk with 2 s dead zone (frames 300-359 interpolated); floor 0.16° off; 18166 pts, 78+289s |
+| longwalk_nogap | typical | 600/600 | 0.368 px | 0.27% | 0.141% | 0.217° | 20 s walk round a corner, no dead zone; floor 1.71° off; 18981 pts, 68+416s |
 
 **Blender round-trip** (`tests/test_blender.py`, run with Blender's Python or the `bpy` module):
 1. Unzips an export and runs `build_scene.py` inside Blender 5.0.
@@ -312,21 +346,35 @@ To get `bpy` without a Blender install: `pip install bpy` into a Python 3.11 ven
   but not motion blur, rolling shutter, lighting changes, reflections, or real lens behaviour.
   Expect real footage to give higher errors than the table above.
 - **Focal length can be unobservable.** This happens with pure translation over a single plane, and
-  is weak for forward dollies. CamTrack warns, and the weak prior keeps the result plausible (7% /
-  2.4% error in the flat / forward tests). Enter the real focal length when you know it.
-- **Zoom shots** (variable focal) solved with a 7% focal scale bias and 0.12% path error in the
-  synthetic test, because zoom and dolly are partly ambiguous.
+  is weak for forward dollies. CamTrack warns, and the weak prior keeps the result plausible (see the
+  flat and forward rows above). Enter the real focal length when you know it.
+- **Zoom shots** (variable focal) solve with a few percent of focal scale bias, because zoom and dolly
+  are partly ambiguous.
+- **Dead zones are interpolated, not measured.** Frames where nothing can be tracked (heavy blur, a
+  covered lens, a blank wall) get a smooth curve between the solved frames either side, and the warning
+  lists them. Bridging the solve across a dead zone needs the scenery before and after it to overlap
+  within about 4 seconds. If the camera ends up looking at entirely new scenery, that part is solved
+  as a separate segment and joined by camera-motion continuity: an estimate, flagged in the warnings.
+- **Exactly repeating patterns** (identical tiles, parking bays, rows of windows) can produce wrong
+  matches across a dead zone, because a feature and its identical copy cannot be told apart. Bridging
+  checks the geometry, but a perfectly regular pattern can still fool it.
+- **Long clips:** tested up to 600 frames (20 s at 30 fps) with a corner turn and a 2 s dead zone. A
+  600-frame clip takes roughly 2 minutes to track and 4–8 minutes to solve on 4 cores.
+- **Floor detection** picks the lowest well-supported horizontal surface beneath the camera. On a
+  sloped street, a ramp, or a floor with almost no texture, check the plane and set it with the target
+  if needed.
 - **Lens model** is radial k1/k2 with the principal point fixed at the image centre. There is no
   tangential, fisheye or anamorphic model, and no rolling-shutter correction.
 - **Moving objects** are rejected by epipolar consistency and reprojection error. An object moving
   along the epipolar lines, or one dominating the frame, can still disturb a solve. In the outdoor
-  test, 4 of 4,092 points (0.1%) on the moving car survived; they did not measurably affect the camera.
+  test, 33 of 4,653 points (0.7%) on the moving car survived; they did not measurably affect the camera.
   Delete such points and re-solve.
 - **Tripod solves** have no depth. Points lie on a sphere, so the ground plane and the target are
   unavailable.
-- **Low-texture footage** solves, at ~0.8 px error in the test, but produces many short tracks and is
-  slower.
+- **Low-texture footage** solves (see the table) but is the most fragile case. Its accuracy varied
+  noticeably with tracker settings during tuning.
 - **Speed.** A 120-frame 720p clip takes about 1–4 minutes on 4 CPU cores with the native engine,
+  a 600-frame clip roughly 5–8 minutes,
   and around 6 minutes with COLMAP. The solver favours accuracy over speed; there is no GPU path.
 - **Blender** cameras are pinhole. Distortion is stored on the movie clip and the background is shown
   undistorted; to composite onto the original distorted plate, add a Movie Distortion node in the

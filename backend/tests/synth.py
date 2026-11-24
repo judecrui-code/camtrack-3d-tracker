@@ -336,9 +336,90 @@ def scenario(name, n=120):
             u = i / (n - 1)
             cam = (-3 + 5 * u, -5, 1.8)
             poses.append(look_at(cam, (cam[0] * 0.5, 7, 1.0)))
+    elif name in ("longwalk", "longwalk_nogap"):
+        desc = ("Long handheld walk (20 s, 600 frames): down a street, round a corner, with a 2 s "
+                "motion-blur dead zone (frames 300-359) where nothing can be tracked." if name == "longwalk"
+                else "Long handheld walk (20 s, 600 frames) without a dead zone (control).")
+        # large NON-repeating textures: exact tiling makes wide-baseline matching ambiguous by construction
+        # (a feature and its copy one tile away are indistinguishable), which real scenes rarely are
+        big = lambda sd, b: texture(sd, size=4096, base=b, detail=6.0)
+        quads += [ground(big(91, (110, 105, 98)), extent=90, subdiv=20, rep=1)]
+        # street along +y (x in [-7, 7]) turning right into a corridor along +x (y in [14, 27])
+        quads += [wall((-7, -25), (-7, 27), 9, big(92, (120, 100, 90)), subdiv=12, rep=1),
+                  wall((7, 14), (7, -25), 9, big(94, (110, 115, 100)), subdiv=10, rep=1),
+                  wall((7, 14), (45, 14), 8, big(95, (125, 105, 110)), subdiv=10, rep=1),
+                  wall((45, 27), (-7, 27), 12, big(97, (115, 115, 105)), subdiv=12, rep=1),
+                  wall((45, 14), (45, 27), 10, big(96, (95, 105, 125)), subdiv=4, rep=1)]
+        rng_b = np.random.default_rng(11)
+        for k in range(10):
+            y = -15 + 3.0 * k
+            x = (-5.0 if k % 2 else 5.0) + rng_b.uniform(-0.6, 0.6)
+            quads += box((x, y, 0.5), (1.0, 1.0, 1.0), T[k % 10])
+        for k in range(7):
+            quads += box((10 + 4.0 * k, 16.0 if k % 2 else 25.0, 0.5), (1.0, 1.0, 1.0), T[(k + 3) % 10])
+        quads += sky(160)
+        f = 1000.0
+        # path: straight along +y, quarter turn (r=6) to +x, straight along +x; uniform speed
+        L1, R_, L3 = 24.0, 6.0, 14.0
+        La = R_ * np.pi / 2
+        total = L1 + La + L3
+        def at(sl):
+            if sl <= L1:
+                return np.array([0.0, -10 + sl]), np.array([0.0, 1.0])
+            if sl <= L1 + La:
+                a = (sl - L1) / R_
+                return np.array([R_ - R_ * np.cos(a), -10 + L1 + R_ * np.sin(a)]), np.array([np.sin(a), np.cos(a)])
+            d = sl - L1 - La
+            return np.array([R_ + d, -10 + L1 + R_]), np.array([1.0, 0.0])
+        for i in range(n):
+            u = i / (n - 1)
+            p, tan = at(u * total)
+            bob = 0.04 * np.sin(2 * np.pi * u * 34)           # footsteps
+            sway = 0.10 * np.sin(2 * np.pi * u * 3.0)          # looking around
+            yaw = np.arctan2(tan[0], tan[1]) + sway
+            cam = (p[0], p[1], 1.65 + bob)
+            look = (p[0] + 10 * np.sin(yaw), p[1] + 10 * np.cos(yaw), 1.2 + 0.4 * np.sin(2 * np.pi * u * 2))
+            poses.append(look_at(cam, look))
     else:
         raise ValueError(name)
     return quads, poses, f, k1, k2, noise, desc
+
+
+# frames where tracking is destroyed (heavy motion blur + underexposure), per scenario
+DEAD_ZONES = {"longwalk": (300, 360)}
+
+
+def dead_zone(img, strength=1.0):
+    k = np.zeros((1, 71), np.float32)
+    k[0, :] = 1.0 / 71
+    out = cv2.filter2D(img, -1, k)
+    out = cv2.GaussianBlur(out, (0, 0), 6)
+    return np.clip(out.astype(np.float32) * 0.35, 0, 255).astype(np.uint8)
+
+
+_W = {}
+
+
+def _init_worker(name, n):
+    quads, poses, f, k1, k2, noise, desc = scenario(name, n)
+    flist = f if isinstance(f, list) else None
+    _W.update(quads=quads, poses=poses, flist=flist,
+              r=Renderer(flist[0] if flist else f, k1=k1, k2=k2, noise=noise), name=name)
+
+
+def _render_one(args):
+    i, out_path = args
+    r, flist = _W["r"], _W["flist"]
+    if flist:
+        r.f = flist[i]
+        r.K[0, 0] = r.K[1, 1] = r.Ku[0, 0] = r.Ku[1, 1] = flist[i]
+    R, t = _W["poses"][i]
+    img = r.render(_W["quads"], R, t, i, np.random.default_rng(1000 + i))
+    dz = DEAD_ZONES.get(_W["name"])
+    if dz and dz[0] <= i < dz[1]:
+        img = dead_zone(img)
+    cv2.imwrite(out_path, img)
+    return i
 
 
 SCENARIOS = ["forward", "sideways", "orbit", "flat", "outdoor", "indoor", "lowtexture", "tripod", "zoom"]
@@ -352,18 +433,30 @@ def generate(name, out_dir, n=120, fps=30):
     rng = np.random.default_rng(7)
     os.makedirs(out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
-        for i, (R, t) in enumerate(poses):
-            if flist:  # zoom: per-frame focal length (no distortion in this scenario)
-                r.f = flist[i]
-                r.K[0, 0] = r.K[1, 1] = r.Ku[0, 0] = r.Ku[1, 1] = flist[i]
-            img = r.render(quads, R, t, i, rng)
-            cv2.imwrite(os.path.join(td, f"{i:05d}.png"), img)
+        if n > 150:  # long clips: render in parallel
+            import multiprocessing as mp
+            ctx = mp.get_context("fork")
+            with ctx.Pool(os.cpu_count() or 4, initializer=_init_worker, initargs=(name, n)) as pool:
+                for k, _ in enumerate(pool.imap_unordered(_render_one, [(i, os.path.join(td, f"{i:05d}.png"))
+                                                                        for i in range(n)], chunksize=4)):
+                    if k % 50 == 0:
+                        print(f"  {k}/{n}", flush=True)
+        else:
+            for i, (R, t) in enumerate(poses):
+                if flist:  # zoom: per-frame focal length (no distortion in this scenario)
+                    r.f = flist[i]
+                    r.K[0, 0] = r.K[1, 1] = r.Ku[0, 0] = r.Ku[1, 1] = flist[i]
+                img = r.render(quads, R, t, i, rng)
+                dz = DEAD_ZONES.get(name)
+                if dz and dz[0] <= i < dz[1]:
+                    img = dead_zone(img)
+                cv2.imwrite(os.path.join(td, f"{i:05d}.png"), img)
         mp4 = os.path.join(out_dir, f"{name}.mp4")
         encode(td, mp4, fps)
     gt = dict(name=name, description=desc, width=W, height=H, fps=fps, frames=n, f=flist[0] if flist else f,
               f_per_frame=flist, cx=(W - 1) / 2, cy=(H - 1) / 2,
               k1=k1, k2=k2, poses=[dict(R=R.tolist(), t=t.tolist()) for R, t in poses],
-              tripod=name == "tripod")
+              tripod=name == "tripod", dead_zone=DEAD_ZONES.get(name))
     with open(os.path.join(out_dir, f"{name}.gt.json"), "w") as fh:
         json.dump(gt, fh)
     return mp4
@@ -374,4 +467,4 @@ if __name__ == "__main__":
     names = sys.argv[2:] or SCENARIOS
     for nm in names:
         print("rendering", nm, flush=True)
-        print(generate(nm, out))
+        print(generate(nm, out, n=600 if nm.startswith("longwalk") else 120))
